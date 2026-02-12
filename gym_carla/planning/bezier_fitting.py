@@ -1,0 +1,330 @@
+#!/usr/bin/env python
+"""
+bezier_fitting.py — 在 Frenet 坐标系下进行 5 阶贝塞尔曲线轨迹拟合
+
+论文依据 (§2.2.2):
+  1. 在 Frenet (s, d) 坐标系下构造贝塞尔曲线控制点
+  2. d(s) 用 5 阶贝塞尔多项式参数化，保证:
+     - 起点切线沿 s 轴 (平滑接入当前行驶方向)
+     - 终点切线沿 s 轴 (平滑汇入目标车道)
+  3. 采样后通过 FrenetTransform 转回笛卡尔坐标
+
+与上层 RL 的接口:
+  - Q1 输出 Goal ∈ {0: 左换道, 1: 保持, 2: 右换道}
+  - Q2 输出 Offset ∈ {0: 偏左Δd, 1: 不偏, 2: 偏右-Δd}
+  - 本模块根据 (Goal, Offset) 确定 Frenet 终点 d_f，生成轨迹
+"""
+
+import numpy as np
+from typing import List, Tuple, Optional
+
+from gym_carla.planning.frenet_transform import FrenetTransform
+
+
+class BezierFitting:
+    """5 阶贝塞尔曲线轨迹生成器 (Frenet 坐标系)。
+
+    根据论文 §2.2.2，轨迹在 Frenet 系下表示为 d = B(t)，其中:
+      - t ∈ [0, 1] 为贝塞尔参数
+      - s 从 s0 到 sf 线性映射
+      - d 由 5 阶贝塞尔曲线决定横向偏移
+
+    Attributes:
+        frenet: FrenetTransform 实例，用于坐标转换。
+        lane_width: 车道宽度 (m)，用于计算换道目标 d。
+        plan_horizon: 规划距离 (m)，即 sf - s0。
+        offset_magnitude: Q2 偏移量的绝对值 (m)。
+        n_samples: 轨迹采样点数。
+    """
+
+    def __init__(
+        self,
+        frenet: FrenetTransform,
+        lane_width: float = 3.5,
+        plan_horizon: float = 30.0,
+        offset_magnitude: float = 0.5,
+        n_samples: int = 50,
+    ):
+        """
+        Args:
+            frenet:            FrenetTransform 实例 (参考线已构建)。
+            lane_width:        标准车道宽度 (m)，CARLA 默认约 3.5m。
+            plan_horizon:      纵向规划距离 (m)，即 Δs = sf - s0。
+            offset_magnitude:  Q2 微调偏移量绝对值 (m)。
+            n_samples:         沿轨迹的采样点数。
+        """
+        self.frenet = frenet
+        self.lane_width = lane_width
+        self.plan_horizon = plan_horizon
+        self.offset_magnitude = offset_magnitude
+        self.n_samples = n_samples
+
+    # ------------------------------------------------------------------
+    # 核心 API
+    # ------------------------------------------------------------------
+
+    def generate_trajectory(
+        self,
+        ego_x: float,
+        ego_y: float,
+        ego_yaw: float,
+        goal: int,
+        offset: int,
+    ) -> np.ndarray:
+        """根据 RL 的 (Goal, Offset) 输出生成参考轨迹。
+
+        流程:
+          1. 将自车位置转换到 Frenet 坐标 (s0, d0)
+          2. 根据 Goal 和 Offset 确定终点 (sf, df)
+          3. 在 Frenet 系下构造 5 阶贝塞尔控制点
+          4. 采样 → Frenet → Cartesian
+
+        Args:
+            ego_x, ego_y: 自车当前笛卡尔坐标 (m)。
+            ego_yaw:      自车当前航向角 (rad)。
+            goal:         Q1 输出。0=左换道, 1=保持, 2=右换道。
+            offset:       Q2 输出。0=偏左, 1=不偏, 2=偏右。
+
+        Returns:
+            np.ndarray: 形状 (n_samples, 2) 的轨迹点 [[x, y], ...]。
+                        笛卡尔坐标，供 trajectory_tracker 跟踪。
+        """
+        # Step 1: 自车 → Frenet
+        s0, d0 = self.frenet.cartesian_to_frenet(ego_x, ego_y, ego_yaw)
+
+        # Step 2: 确定终点 Frenet 坐标
+        sf = s0 + self.plan_horizon
+
+        # 限制 sf 不超过参考线总长度
+        sf = min(sf, self.frenet.total_length - 0.1)
+        if sf <= s0:
+            # 参考线太短，退化为直行
+            sf = s0 + 5.0
+
+        df = self._compute_target_d(d0, goal, offset)
+
+        # Step 3: 生成 Frenet 系下的贝塞尔轨迹
+        s_arr, d_arr = self._bezier_frenet(s0, d0, sf, df)
+
+        # Step 4: Frenet → Cartesian
+        trajectory = self.frenet.frenet_to_cartesian_array(s_arr, d_arr)
+
+        return trajectory
+
+    # ------------------------------------------------------------------
+    # 轨迹终点 d 的计算
+    # ------------------------------------------------------------------
+
+    def _compute_target_d(self, d0: float, goal: int, offset: int) -> float:
+        """根据 Q1(Goal) 和 Q2(Offset) 计算 Frenet 系终点横向偏移 df。
+
+        目标 d 的计算:
+          Goal = 0 (左换道): d_goal = d0 + lane_width   (向左偏一个车道)
+          Goal = 1 (保持):   d_goal = 0                 (回到车道中心)
+          Goal = 2 (右换道): d_goal = d0 - lane_width   (向右偏一个车道)
+
+        Offset 微调:
+          Offset = 0 (偏左):  d_goal += offset_magnitude
+          Offset = 1 (不偏):  d_goal += 0
+          Offset = 2 (偏右):  d_goal -= offset_magnitude
+
+        Args:
+            d0:     当前横向偏移 (m)。
+            goal:   Q1 输出 {0, 1, 2}。
+            offset: Q2 输出 {0, 1, 2}。
+
+        Returns:
+            df: 目标横向偏移 (m)。
+        """
+        # 行为层 Goal → 大方向
+        if goal == 0:  # 左换道
+            d_goal = d0 + self.lane_width
+        elif goal == 2:  # 右换道
+            d_goal = d0 - self.lane_width
+        else:  # goal == 1, 保持车道
+            d_goal = 0.0  # 回到当前车道中心
+
+        # 轨迹层 Offset → 微调
+        if offset == 0:  # 偏左
+            d_goal += self.offset_magnitude
+        elif offset == 2:  # 偏右
+            d_goal -= self.offset_magnitude
+        # offset == 1: 不偏
+
+        return d_goal
+
+    # ------------------------------------------------------------------
+    # 5 阶贝塞尔曲线 (Frenet 系)
+    # ------------------------------------------------------------------
+
+    def _bezier_frenet(
+        self, s0: float, d0: float, sf: float, df: float
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """在 Frenet 坐标系下用 5 阶贝塞尔曲线生成 d(s) 轨迹。
+
+        5 阶贝塞尔曲线有 6 个控制点 P0..P5。
+        论文 §2.2.2 的关键约束:
+          - 起点: d(0) = d0，d'(0) = 0 (切线沿 s 轴)
+          - 终点: d(1) = df，d'(1) = 0 (切线沿 s 轴)
+          - d''(0) = 0, d''(1) = 0 (曲率连续，保证平滑)
+
+        由这些约束推导出控制点:
+          P0_d = d0
+          P1_d = d0            (保证 d'(0) = 0)
+          P2_d = d0            (保证 d''(0) = 0)
+          P3_d = df            (保证 d''(1) = 0)
+          P4_d = df            (保证 d'(1) = 0)
+          P5_d = df            (终点)
+
+        s 方向线性映射: s(t) = s0 + t * (sf - s0)
+
+        Args:
+            s0, d0: 起点 Frenet 坐标。
+            sf, df: 终点 Frenet 坐标。
+
+        Returns:
+            (s_arr, d_arr): 各 n_samples 个点的纵向弧长和横向偏移。
+        """
+        # 贝塞尔参数 t ∈ [0, 1]
+        t = np.linspace(0.0, 1.0, self.n_samples)
+
+        # 6 个控制点的 d 值 (根据边界条件推导)
+        cp_d = np.array([d0, d0, d0, df, df, df])
+
+        # 5 阶贝塞尔基函数 B_i^5(t)
+        d_arr = self._bezier_curve(t, cp_d)
+
+        # s 方向线性映射
+        s_arr = s0 + t * (sf - s0)
+
+        return s_arr, d_arr
+
+    @staticmethod
+    def _bezier_curve(t: np.ndarray, control_points: np.ndarray) -> np.ndarray:
+        """计算 n 阶贝塞尔曲线值。
+
+        B(t) = Σ_{i=0}^{n} C(n,i) * (1-t)^{n-i} * t^i * P_i
+
+        Args:
+            t:              参数数组 (M,)，值在 [0, 1]。
+            control_points: 控制点数组 (n+1,)。
+
+        Returns:
+            曲线值数组 (M,)。
+        """
+        n = len(control_points) - 1
+        result = np.zeros_like(t)
+
+        for i in range(n + 1):
+            # 二项式系数 C(n, i)
+            binom = _binomial_coeff(n, i)
+            # Bernstein 基多项式
+            basis = binom * (t ** i) * ((1.0 - t) ** (n - i))
+            result += basis * control_points[i]
+
+        return result
+
+    # ------------------------------------------------------------------
+    # 调试 / 可视化辅助
+    # ------------------------------------------------------------------
+
+    def generate_trajectory_frenet(
+        self, ego_x: float, ego_y: float, ego_yaw: float,
+        goal: int, offset: int,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """同 generate_trajectory，但返回 Frenet 坐标 (用于调试/绘图)。
+
+        Returns:
+            (s_arr, d_arr): 轨迹在 Frenet 系下的坐标。
+        """
+        s0, d0 = self.frenet.cartesian_to_frenet(ego_x, ego_y, ego_yaw)
+        sf = min(s0 + self.plan_horizon, self.frenet.total_length - 0.1)
+        if sf <= s0:
+            sf = s0 + 5.0
+        df = self._compute_target_d(d0, goal, offset)
+        return self._bezier_frenet(s0, d0, sf, df)
+
+    def get_trajectory_curvature(self, trajectory: np.ndarray) -> np.ndarray:
+        """计算笛卡尔轨迹的曲率序列 (用于奖励函数中的平滑性评估)。
+
+        κ = |x'y'' - y'x''| / (x'^2 + y'^2)^{3/2}
+
+        Args:
+            trajectory: (N, 2) 轨迹点。
+
+        Returns:
+            (N-2,) 曲率数组。
+        """
+        dx = np.gradient(trajectory[:, 0])
+        dy = np.gradient(trajectory[:, 1])
+        ddx = np.gradient(dx)
+        ddy = np.gradient(dy)
+
+        denom = (dx ** 2 + dy ** 2) ** 1.5
+        denom = np.maximum(denom, 1e-6)  # 避免除零
+        curvature = np.abs(dx * ddy - dy * ddx) / denom
+        return curvature
+
+
+# ======================================================================
+# 工具函数
+# ======================================================================
+
+def _binomial_coeff(n: int, k: int) -> int:
+    """计算二项式系数 C(n, k)。"""
+    if k < 0 or k > n:
+        return 0
+    if k == 0 or k == n:
+        return 1
+    # 利用对称性
+    k = min(k, n - k)
+    result = 1
+    for i in range(k):
+        result = result * (n - i) // (i + 1)
+    return result
+
+
+# ======================================================================
+# 快速自测
+# ======================================================================
+if __name__ == "__main__":
+    # 构建直线参考线 (沿 x 轴, 200m)
+    waypoints = [[i * 5.0, 0.0, 0.0] for i in range(41)]  # 200m
+    ft = FrenetTransform(ds=0.5)
+    ft.build_reference_line(waypoints)
+
+    planner = BezierFitting(
+        frenet=ft,
+        lane_width=3.5,
+        plan_horizon=30.0,
+        offset_magnitude=0.5,
+        n_samples=50,
+    )
+
+    # 自车在 (10, 0)，朝 x 轴正方向行驶
+    ego_x, ego_y, ego_yaw = 10.0, 0.0, 0.0
+
+    print("=" * 60)
+    print("Test: Bezier trajectory generation")
+    print("=" * 60)
+
+    for goal_name, goal in [("左换道", 0), ("保持", 1), ("右换道", 2)]:
+        traj = planner.generate_trajectory(ego_x, ego_y, ego_yaw, goal=goal, offset=1)
+        s_arr, d_arr = planner.generate_trajectory_frenet(ego_x, ego_y, ego_yaw, goal=goal, offset=1)
+        curv = planner.get_trajectory_curvature(traj)
+
+        print(f"\n--- Goal: {goal_name} (offset=不偏) ---")
+        print(f"  起点 Cartesian: ({traj[0, 0]:.2f}, {traj[0, 1]:.2f})")
+        print(f"  终点 Cartesian: ({traj[-1, 0]:.2f}, {traj[-1, 1]:.2f})")
+        print(f"  起点 Frenet:    s={s_arr[0]:.2f}, d={d_arr[0]:.2f}")
+        print(f"  终点 Frenet:    s={s_arr[-1]:.2f}, d={d_arr[-1]:.2f}")
+        print(f"  最大曲率:       {curv.max():.6f}")
+        print(f"  轨迹点数:       {len(traj)}")
+
+    # 测试 offset 效果
+    print("\n" + "=" * 60)
+    print("Test: Offset effect on lane-keeping")
+    print("=" * 60)
+    for off_name, off in [("偏左", 0), ("不偏", 1), ("偏右", 2)]:
+        traj = planner.generate_trajectory(ego_x, ego_y, ego_yaw, goal=1, offset=off)
+        print(f"  保持+{off_name}: 终点 y={traj[-1, 1]:.3f} m")
