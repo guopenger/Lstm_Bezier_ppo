@@ -23,6 +23,10 @@ from gym_carla.envs.render import BirdeyeRender
 from gym_carla.envs.route_planner import RoutePlanner
 from gym_carla.envs.misc import *
 
+# Hierarchical RL modules (Phase 1)
+from gym_carla.envs.zone_detector import ZoneDetector
+from gym_carla.planning.state_buffer import StateBuffer
+
 
 class CarlaEnv(gym.Env):
   """An OpenAI gym wrapper for CARLA simulator."""
@@ -50,6 +54,22 @@ class CarlaEnv(gym.Env):
       self.pixor_size = params['pixor_size']
     else:
       self.pixor = False
+
+    # Hierarchical RL mode (Phase 1: observation only)
+    self.hierarchical = params.get('hierarchical', False)
+    if self.hierarchical:
+      self.state_dim = params.get('state_dim', 18)
+      self.seq_len = params.get('seq_len', 3)
+      self.lane_width = params.get('lane_width', 3.5)
+      self.zone_detector = ZoneDetector(
+        lane_width=self.lane_width,
+        front_dist=params.get('zone_front_dist', 50.0),
+        rear_dist=params.get('zone_rear_dist', 30.0),
+      )
+      self.state_buffer = StateBuffer(
+        state_dim=self.state_dim,
+        seq_len=self.seq_len,
+      )
 
     # Destination
     if params['task_mode'] == 'roundabout':
@@ -83,11 +103,19 @@ class CarlaEnv(gym.Env):
         })
     self.observation_space = spaces.Dict(observation_space_dict)
 
+    # Override observation space for hierarchical RL
+    if self.hierarchical:
+      self.observation_space = spaces.Box(
+        low=-np.inf, high=np.inf,
+        shape=(self.seq_len, self.state_dim),
+        dtype=np.float32)
+
     # Connect to carla server and get world object
     print('connecting to Carla server...')
     client = carla.Client('localhost', params['port'])
     client.set_timeout(10.0)
     self.world = client.load_world(params['town'])
+    self.carla_map = self.world.get_map()
     print('Carla server connected!')
 
     # Set weather
@@ -258,6 +286,10 @@ class CarlaEnv(gym.Env):
 
     # Set ego information for render
     self.birdeye_render.set_hero(self.ego, self.ego.id)
+
+    # Reset hierarchical state buffer
+    if self.hierarchical:
+      self.state_buffer.reset()
 
     return self._get_obs()
   
@@ -471,6 +503,10 @@ class CarlaEnv(gym.Env):
 
   def _get_obs(self):
     """Get the observations."""
+    # Hierarchical mode: return (seq_len, state_dim) state sequence
+    if self.hierarchical:
+      return self._get_hierarchical_obs()
+
     ## Birdeye rendering
     self.birdeye_render.vehicle_polygons = self.vehicle_polygons
     self.birdeye_render.walker_polygons = self.walker_polygons
@@ -618,6 +654,35 @@ class CarlaEnv(gym.Env):
       })
 
     return obs
+
+  def _get_hierarchical_obs(self):
+    """Get hierarchical observation: 18-dim state × 3 timesteps.
+
+    论文 §2.1.2: 状态空间 = [v_ego, lane_id, Δv×8, Δd×8] (18维)
+    论文 §2.2.1: 输入过去 3 个采样时刻的状态序列
+
+    Returns:
+      np.ndarray: shape (seq_len, state_dim) = (3, 18), dtype float32.
+    """
+    # 使用 zone_detector 计算 18 维状态向量
+    state_18d = self.zone_detector.detect(
+      self.world, self.ego, self.carla_map)
+    self.state_buffer.push(state_18d)
+
+    # Debug: 首次调用时打印状态信息
+    if self.time_step == 0 and self.reset_step <= 1:
+      print(f"[Hierarchical Obs] state shape: {self.state_buffer.get_numpy().shape}")
+      print(f"[Hierarchical Obs] state[0] (latest):")
+      print(f"  v_ego={state_18d[0]:.2f} m/s, lane_id={state_18d[1]:.0f}")
+      print(f"  Δv: {state_18d[2:10]}")
+      print(f"  Δd: {state_18d[10:18]}")
+
+    # Process pygame events to prevent window from freezing
+    for event in pygame.event.get():
+      if event.type == pygame.QUIT:
+        pass
+
+    return self.state_buffer.get_numpy().astype(np.float32)
 
   def _get_reward(self):
     """Calculate the step reward."""
