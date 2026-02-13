@@ -30,6 +30,7 @@ from gym_carla.planning.frenet_transform import FrenetTransform
 from gym_carla.planning.bezier_fitting import BezierFitting
 from gym_carla.control.trajectory_tracker import TrajectoryTracker, EgoState
 from gym_carla import config as cfg
+from gym_carla.reward import get_hierarchical_reward
 
 
 class CarlaEnv(gym.Env):
@@ -85,6 +86,7 @@ class CarlaEnv(gym.Env):
       )
       self._last_trajectory = None  # cache for reward computation
       self._last_tracking_error = None
+      self.last_lane_speed = 0.0 
 
     # Destination
     if params['task_mode'] == 'roundabout':
@@ -662,68 +664,30 @@ class CarlaEnv(gym.Env):
         print(f"[Hierarchical] Build reference line failed: {e}")
 
   def _get_hierarchical_reward(self, goal, offset):
-    """Hierarchical reward: R = α * R_Q1 + β * R_Q2.
-
-    R_Q1 (behavior): safety + efficiency + lane change quality
-    R_Q2 (trajectory): tracking error + smoothness + comfort
     """
-    v = self.ego.get_velocity()
-    speed = np.sqrt(v.x**2 + v.y**2)
-
-    # ---- R_Q1: Behavior layer reward ----
-    # Collision penalty
-    r_collision = cfg.W_COLLISION if len(self.collision_hist) > 0 else 0.0
-
-    # Speed tracking reward
-    r_speed = cfg.W_SPEED * (1.0 - abs(speed - self.desired_speed) / max(self.desired_speed, 1.0))
-
-    # Out of lane penalty
-    ego_x, ego_y = get_pos(self.ego)
-    dis, w = get_lane_dis(self.waypoints, ego_x, ego_y)
-    r_out = cfg.W_OUT_LANE if abs(dis) > self.out_lane_thres else 0.0
-
-    # Unnecessary lane change penalty
-    r_lc = 0.0
-    if goal != 1:  # not lane keeping
-      # Penalize lane change when speed is already good
-      if abs(speed - self.desired_speed) < 1.0:
-        r_lc = cfg.W_UNNECESSARY_LC
-
-    r_q1 = r_collision + r_speed + r_out + r_lc
-
-    # ---- R_Q2: Trajectory layer reward ----
-    r_q2 = 0.0
-    if self._last_tracking_error is not None:
-      lat_err = self._last_tracking_error['lateral_error']
-      head_err = self._last_tracking_error['heading_error']
-      r_tracking = cfg.W_TRACKING_ERROR * lat_err
-
-      # Curvature penalty (smoothness)
-      r_curvature = 0.0
-      if self._last_trajectory is not None and len(self._last_trajectory) >= 3:
-        dx = np.gradient(self._last_trajectory[:, 0])
-        dy = np.gradient(self._last_trajectory[:, 1])
-        ddx = np.gradient(dx)
-        ddy = np.gradient(dy)
-        denom = np.maximum((dx**2 + dy**2)**1.5, 1e-6)
-        curv = np.abs(dx * ddy - dy * ddx) / denom
-        r_curvature = cfg.W_CURVATURE * float(np.mean(curv))
-
-      # Comfort: lateral acceleration penalty
-      steer_val = abs(self.ego.get_control().steer)
-      r_comfort = cfg.W_COMFORT * steer_val * speed**2
-
-      r_q2 = r_tracking + r_curvature + r_comfort
-
-    # Step penalty (encourage progress)
-    r_step = cfg.W_STEP
-
-    # Total reward
-    r_total = r_q1 + r_q2 + r_step
-    return r_total
+    调用论文奖励函数
+    
+    Args:
+        goal: Q1 action (0=left, 1=keep, 2=right)
+        offset: Q2 action (0=left, 1=center, 2=right) - 论文中未直接使用
+    
+    Returns:
+        float: reward
+    """
+    reward, new_last_lane_speed = get_hierarchical_reward(
+        ego=self.ego,
+        collision_hist=self.collision_hist,
+        desired_speed=self.desired_speed,
+        goal=goal,
+        last_lane_speed=self.last_lane_speed
+    )
+    
+    # 更新状态
+    self.last_lane_speed = new_last_lane_speed
+    
+    return reward
 
   # ==================================================================
-
   def _get_obs(self):
     """Get the observations."""
     # Hierarchical mode: return (seq_len, state_dim) state sequence

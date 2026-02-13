@@ -57,21 +57,12 @@ MAX_STEPS_PER_EPISODE = 500
 TARGET_UPDATE_FREQ = 100     # Target network 更新频率
 
 # ==============================================================
-# Reward Weights (分层奖励)
+# Reward Function 
 # ==============================================================
-# Q1 行为层奖励
-W_COLLISION = -200.0
-W_SPEED = 1.0               # 纵向速度奖励系数
-W_LANE_CHANGE_SUCCESS = 5.0  # 成功换道到更快车道
-W_UNNECESSARY_LC = -1.0      # 不必要换道惩罚
-W_OUT_LANE = -1.0            # 出车道惩罚
-
-# Q2 轨迹层奖励
-W_TRACKING_ERROR = -1.0      # 横向跟踪误差惩罚
-W_CURVATURE = -0.5           # 曲率惩罚 (平滑性)
-W_COMFORT = -0.2             # 横向加速度惩罚 (舒适性)
-W_STEP = -0.1                # 每步存在惩罚
-
+REWARD_WEIGHT_M = 0.5       # Eq.(3) 中的 m，平衡内在和外在奖励
+                            # m=0.5: 均衡速度跟踪和换道决策
+                            # m=0.6: 偏重速度跟踪（内在稳定性）
+                            # m=0.4: 偏重换道决策（外在任务完成）
 # ==============================================================
 # CARLA 连接
 # ==============================================================
@@ -79,5 +70,5 @@ CARLA_HOST = 'localhost'
 CARLA_PORT = 2000
 CARLA_TOWN = 'Town03'
 CARLA_DT = 0.1
-NUMBER_OF_VEHICLES = 20
+NUMBER_OF_VEHICLES = 50
 NUMBER_OF_WALKERS = 0
