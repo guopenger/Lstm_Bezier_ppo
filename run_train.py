@@ -1,3 +1,5 @@
+# 这是最开始的ppo算法，用来跑通carla环境的算法，只是做一个验证而已没用特别大的用处的
+
 import glob
 import os
 import sys

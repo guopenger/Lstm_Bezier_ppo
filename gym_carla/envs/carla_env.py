@@ -23,9 +23,13 @@ from gym_carla.envs.render import BirdeyeRender
 from gym_carla.envs.route_planner import RoutePlanner
 from gym_carla.envs.misc import *
 
-# Hierarchical RL modules (Phase 1)
+# Hierarchical RL modules
 from gym_carla.envs.zone_detector import ZoneDetector
 from gym_carla.planning.state_buffer import StateBuffer
+from gym_carla.planning.frenet_transform import FrenetTransform
+from gym_carla.planning.bezier_fitting import BezierFitting
+from gym_carla.control.trajectory_tracker import TrajectoryTracker, EgoState
+from gym_carla import config as cfg
 
 
 class CarlaEnv(gym.Env):
@@ -55,21 +59,32 @@ class CarlaEnv(gym.Env):
     else:
       self.pixor = False
 
-    # Hierarchical RL mode (Phase 1: observation only)
+    # Hierarchical RL mode
     self.hierarchical = params.get('hierarchical', False)
     if self.hierarchical:
-      self.state_dim = params.get('state_dim', 18)
-      self.seq_len = params.get('seq_len', 3)
-      self.lane_width = params.get('lane_width', 3.5)
+      self.state_dim = params.get('state_dim', cfg.STATE_DIM)
+      self.seq_len = params.get('seq_len', cfg.SEQ_LEN)
+      self.lane_width = params.get('lane_width', cfg.LANE_WIDTH)
       self.zone_detector = ZoneDetector(
         lane_width=self.lane_width,
-        front_dist=params.get('zone_front_dist', 50.0),
-        rear_dist=params.get('zone_rear_dist', 30.0),
+        front_dist=params.get('zone_front_dist', cfg.ZONE_FRONT_DIST),
+        rear_dist=params.get('zone_rear_dist', cfg.ZONE_REAR_DIST),
       )
       self.state_buffer = StateBuffer(
         state_dim=self.state_dim,
         seq_len=self.seq_len,
       )
+      # Frenet + Bezier + Tracker
+      self.frenet = FrenetTransform(ds=0.5)
+      self.bezier = None  # built in reset() after reference line is ready
+      self.tracker = TrajectoryTracker(
+        wheelbase=cfg.WHEELBASE,
+        desired_speed=params.get('desired_speed', cfg.DESIRED_SPEED),
+        lookahead_dist=cfg.LOOKAHEAD_DIST,
+        dt=params.get('dt', cfg.CONTROL_DT),
+      )
+      self._last_trajectory = None  # cache for reward computation
+      self._last_tracking_error = None
 
     # Destination
     if params['task_mode'] == 'roundabout':
@@ -109,12 +124,26 @@ class CarlaEnv(gym.Env):
         low=-np.inf, high=np.inf,
         shape=(self.seq_len, self.state_dim),
         dtype=np.float32)
+      # Override action space: MultiDiscrete([num_goals, num_offsets])
+      self.action_space = spaces.MultiDiscrete([cfg.NUM_GOALS, cfg.NUM_OFFSETS])
 
     # Connect to carla server and get world object
     print('connecting to Carla server...')
     client = carla.Client('localhost', params['port'])
-    client.set_timeout(10.0)
-    self.world = client.load_world(params['town'])
+    client.set_timeout(60.0)          # 首次加载地图可能很慢，给足 60 秒
+    self.client = client              # 保存引用
+
+    # 检查当前地图是否已经是目标地图，避免 load_world 触发 Shader 重编译崩溃
+    current_world = client.get_world()
+    current_map_name = current_world.get_map().name.split('/')[-1]
+    target_town = params['town']
+    if current_map_name == target_town:
+      print(f'当前地图已经是 {target_town}，跳过 load_world')
+      self.world = current_world
+    else:
+      print(f'当前地图 {current_map_name} != {target_town}，正在切换...')
+      self.world = client.load_world(target_town)
+
     self.carla_map = self.world.get_map()
     print('Carla server connected!')
 
@@ -178,9 +207,17 @@ class CarlaEnv(gym.Env):
       self.pixel_grid = np.vstack((x, y)).T
 
   def reset(self):
-    # Clear sensor objects  
+    # Clear sensor objects carefully to avoid WARNINGs
+    if self.collision_sensor is not None and self.collision_sensor.is_alive:
+      self.collision_sensor.destroy()
     self.collision_sensor = None
+
+    if self.lidar_sensor is not None and self.lidar_sensor.is_alive:
+      self.lidar_sensor.destroy()
     self.lidar_sensor = None
+
+    if self.camera_sensor is not None and self.camera_sensor.is_alive:
+      self.camera_sensor.destroy()
     self.camera_sensor = None
 
     # Delete sensors, vehicles and walkers
@@ -252,21 +289,22 @@ class CarlaEnv(gym.Env):
         self.collision_hist.pop(0)
     self.collision_sensor.listen(get_collision_hist)
 
-    # Add lidar sensor
-    self.lidar_sensor = self.world.spawn_actor(self.lidar_bp, self.lidar_trans, attach_to=self.ego)
-    def get_lidar_data(data):
-      self.lidar_data = data
-    self.lidar_sensor.listen(get_lidar_data)
+    # Add lidar sensor (skip in hierarchical mode)
+    if not self.hierarchical:
+      self.lidar_sensor = self.world.spawn_actor(self.lidar_bp, self.lidar_trans, attach_to=self.ego)
+      def get_lidar_data(data):
+        self.lidar_data = data
+      self.lidar_sensor.listen(get_lidar_data)
 
-    # Add camera sensor
-    self.camera_sensor = self.world.spawn_actor(self.camera_bp, self.camera_trans, attach_to=self.ego)
-    def get_camera_img(data):
-      array = np.frombuffer(data.raw_data, dtype = np.dtype("uint8"))
-      array = np.reshape(array, (data.height, data.width, 4))
-      array = array[:, :, :3]
-      array = array[:, :, ::-1]
-      self.camera_img = array
-    self.camera_sensor.listen(get_camera_img)
+      # Add camera sensor
+      self.camera_sensor = self.world.spawn_actor(self.camera_bp, self.camera_trans, attach_to=self.ego)
+      def get_camera_img(data):
+        array = np.frombuffer(data.raw_data, dtype = np.dtype("uint8"))
+        array = np.reshape(array, (data.height, data.width, 4))
+        array = array[:, :, :3]
+        array = array[:, :, ::-1]
+        self.camera_img = array
+      self.camera_sensor.listen(get_camera_img)
 
     # Update timesteps
     self.time_step=0
@@ -287,13 +325,23 @@ class CarlaEnv(gym.Env):
     # Set ego information for render
     self.birdeye_render.set_hero(self.ego, self.ego.id)
 
-    # Reset hierarchical state buffer
+    # Reset hierarchical state buffer and build reference line
     if self.hierarchical:
       self.state_buffer.reset()
+      self.tracker.reset()
+      self._last_trajectory = None
+      self._last_tracking_error = None
+      # Build Frenet reference line from initial waypoints
+      self._build_reference_line()
 
     return self._get_obs()
   
   def step(self, action):
+    # ========== Hierarchical RL mode ==========
+    if self.hierarchical:
+      return self._step_hierarchical(action)
+
+    # ========== Original mode ==========
     # Calculate acceleration and steering
     if self.discrete:
       acc = self.discrete_act[0][action//self.n_steer]
@@ -500,6 +548,181 @@ class CarlaEnv(gym.Env):
       poly=np.matmul(R,poly_local).transpose()+np.repeat([[x,y]],4,axis=0)
       actor_poly_dict[actor.id]=poly
     return actor_poly_dict
+
+  # ==================================================================
+  # Hierarchical RL: step, reward, reference line
+  # ==================================================================
+
+  def _step_hierarchical(self, action):
+    """Hierarchical mode step: action = [goal, offset] → Bezier → Tracker → Control.
+
+    Args:
+      action: array-like [goal, offset], each ∈ {0, 1, 2}.
+        goal:   0=左换道, 1=保持, 2=右换道
+        offset: 0=偏左, 1=不偏, 2=偏右
+    """
+    goal = int(action[0])
+    offset = int(action[1])
+
+    # Get ego state
+    ego_trans = self.ego.get_transform()
+    ego_x = ego_trans.location.x
+    ego_y = ego_trans.location.y
+    ego_yaw = ego_trans.rotation.yaw / 180.0 * np.pi
+    v = self.ego.get_velocity()
+    ego_speed = np.sqrt(v.x**2 + v.y**2)
+
+    # Update reference line periodically
+    if self.time_step % 10 == 0:
+      self._build_reference_line()
+
+    # Generate Bezier trajectory
+    try:
+      trajectory = self.bezier.generate_trajectory(
+        ego_x, ego_y, ego_yaw, goal, offset)
+      self._last_trajectory = trajectory
+    except Exception as e:
+      # Fallback: straight ahead trajectory
+      if self.total_step % 50 == 0:
+        print(f"[Hierarchical] Bezier failed: {e}, using straight fallback")
+      fwd = np.array([np.cos(ego_yaw), np.sin(ego_yaw)])
+      trajectory = np.array([
+        [ego_x + fwd[0] * d, ego_y + fwd[1] * d]
+        for d in np.linspace(1, 30, 50)
+      ])
+      self._last_trajectory = trajectory
+
+    # Trajectory tracking → vehicle control
+    ego_state = EgoState(x=ego_x, y=ego_y, yaw=ego_yaw, speed=ego_speed)
+    throttle, steer, brake = self.tracker.compute_control(trajectory, ego_state)
+
+    # Compute tracking error for reward
+    self._last_tracking_error = self.tracker.compute_tracking_error(
+      trajectory, ego_state)
+
+    # Debug log
+    if self.total_step % 100 == 0:
+      goal_names = ['左换道', '保持', '右换道']
+      offset_names = ['偏左', '不偏', '偏右']
+      err = self._last_tracking_error
+      print(f"[Step {self.total_step}] Goal={goal_names[goal]}, Offset={offset_names[offset]}, "
+            f"speed={ego_speed:.1f}, throttle={throttle:.2f}, steer={steer:.3f}, "
+            f"lat_err={err['lateral_error']:.2f}")
+
+    # Apply control (CARLA steer needs negation)
+    act = carla.VehicleControl(
+      throttle=float(throttle), steer=float(-steer), brake=float(brake))
+    self.ego.apply_control(act)
+
+    self.world.tick()
+
+    # Update polygon lists
+    vehicle_poly_dict = self._get_actor_polygons('vehicle.*')
+    self.vehicle_polygons.append(vehicle_poly_dict)
+    while len(self.vehicle_polygons) > self.max_past_step:
+      self.vehicle_polygons.pop(0)
+    walker_poly_dict = self._get_actor_polygons('walker.*')
+    self.walker_polygons.append(walker_poly_dict)
+    while len(self.walker_polygons) > self.max_past_step:
+      self.walker_polygons.pop(0)
+
+    # Route planner update
+    self.waypoints, _, self.vehicle_front = self.routeplanner.run_step()
+
+    # State information
+    info = {
+      'waypoints': self.waypoints,
+      'vehicle_front': self.vehicle_front,
+      'goal': goal,
+      'offset': offset,
+      'tracking_error': self._last_tracking_error,
+    }
+
+    # Update timesteps
+    self.time_step += 1
+    self.total_step += 1
+
+    return (self._get_obs(), self._get_hierarchical_reward(goal, offset),
+            self._terminal(), copy.deepcopy(info))
+
+  def _build_reference_line(self):
+    """Build Frenet reference line from current waypoints."""
+    try:
+      if len(self.waypoints) >= 2:
+        self.frenet.build_reference_line(self.waypoints)
+        self.bezier = BezierFitting(
+          frenet=self.frenet,
+          lane_width=self.lane_width,
+          plan_horizon=cfg.PLAN_HORIZON,
+          offset_magnitude=cfg.OFFSET_MAGNITUDE,
+          n_samples=cfg.BEZIER_SAMPLES,
+        )
+    except Exception as e:
+      if self.total_step % 50 == 0:
+        print(f"[Hierarchical] Build reference line failed: {e}")
+
+  def _get_hierarchical_reward(self, goal, offset):
+    """Hierarchical reward: R = α * R_Q1 + β * R_Q2.
+
+    R_Q1 (behavior): safety + efficiency + lane change quality
+    R_Q2 (trajectory): tracking error + smoothness + comfort
+    """
+    v = self.ego.get_velocity()
+    speed = np.sqrt(v.x**2 + v.y**2)
+
+    # ---- R_Q1: Behavior layer reward ----
+    # Collision penalty
+    r_collision = cfg.W_COLLISION if len(self.collision_hist) > 0 else 0.0
+
+    # Speed tracking reward
+    r_speed = cfg.W_SPEED * (1.0 - abs(speed - self.desired_speed) / max(self.desired_speed, 1.0))
+
+    # Out of lane penalty
+    ego_x, ego_y = get_pos(self.ego)
+    dis, w = get_lane_dis(self.waypoints, ego_x, ego_y)
+    r_out = cfg.W_OUT_LANE if abs(dis) > self.out_lane_thres else 0.0
+
+    # Unnecessary lane change penalty
+    r_lc = 0.0
+    if goal != 1:  # not lane keeping
+      # Penalize lane change when speed is already good
+      if abs(speed - self.desired_speed) < 1.0:
+        r_lc = cfg.W_UNNECESSARY_LC
+
+    r_q1 = r_collision + r_speed + r_out + r_lc
+
+    # ---- R_Q2: Trajectory layer reward ----
+    r_q2 = 0.0
+    if self._last_tracking_error is not None:
+      lat_err = self._last_tracking_error['lateral_error']
+      head_err = self._last_tracking_error['heading_error']
+      r_tracking = cfg.W_TRACKING_ERROR * lat_err
+
+      # Curvature penalty (smoothness)
+      r_curvature = 0.0
+      if self._last_trajectory is not None and len(self._last_trajectory) >= 3:
+        dx = np.gradient(self._last_trajectory[:, 0])
+        dy = np.gradient(self._last_trajectory[:, 1])
+        ddx = np.gradient(dx)
+        ddy = np.gradient(dy)
+        denom = np.maximum((dx**2 + dy**2)**1.5, 1e-6)
+        curv = np.abs(dx * ddy - dy * ddx) / denom
+        r_curvature = cfg.W_CURVATURE * float(np.mean(curv))
+
+      # Comfort: lateral acceleration penalty
+      steer_val = abs(self.ego.get_control().steer)
+      r_comfort = cfg.W_COMFORT * steer_val * speed**2
+
+      r_q2 = r_tracking + r_curvature + r_comfort
+
+    # Step penalty (encourage progress)
+    r_step = cfg.W_STEP
+
+    # Total reward
+    r_total = r_q1 + r_q2 + r_step
+    return r_total
+
+  # ==================================================================
 
   def _get_obs(self):
     """Get the observations."""

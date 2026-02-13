@@ -1,1 +1,1 @@
-from gym_carla.control.trajectory_tracker import TrajectoryTracker
+from gym_carla.control.trajectory_tracker import TrajectoryTracker, EgoState
