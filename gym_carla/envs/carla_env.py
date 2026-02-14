@@ -126,8 +126,12 @@ class CarlaEnv(gym.Env):
         low=-np.inf, high=np.inf,
         shape=(self.seq_len, self.state_dim),
         dtype=np.float32)
-      # Override action space: MultiDiscrete([num_goals, num_offsets])
-      self.action_space = spaces.MultiDiscrete([cfg.NUM_GOALS, cfg.NUM_OFFSETS])
+      # Hybrid action: [goal ∈ {0,1,2} (discrete), p_off ∈ [-R,R] (continuous)]
+      # 论文 Eq.1: A_g = [g_l, g_r, g_s], Eq.2: A_p = [p_off]
+      self.action_space = spaces.Box(
+        low=np.array([0, -cfg.OFFSET_RANGE], dtype=np.float32),
+        high=np.array([2, cfg.OFFSET_RANGE], dtype=np.float32),
+        dtype=np.float32)
 
     # Connect to carla server and get world object
     print('connecting to Carla server...')
@@ -198,6 +202,11 @@ class CarlaEnv(gym.Env):
     # Record the time of total steps and resetting steps
     self.reset_step = 0
     self.total_step = 0
+
+    # Pre-initialize sensor references (reset() checks these before first use)
+    self.collision_sensor = None
+    self.lidar_sensor = None
+    self.camera_sensor = None
     
     # Initialize the renderer
     self._init_renderer()
@@ -559,12 +568,12 @@ class CarlaEnv(gym.Env):
     """Hierarchical mode step: action = [goal, offset] → Bezier → Tracker → Control.
 
     Args:
-      action: array-like [goal, offset], each ∈ {0, 1, 2}.
-        goal:   0=左换道, 1=保持, 2=右换道
-        offset: 0=偏左, 1=不偏, 2=偏右
+      action: array-like [goal, p_off].
+        goal:  int ∈ {0, 1, 2} — 0=左换道, 1=保持, 2=右换道 (Eq.1)
+        p_off: float — 连续横向偏移量 (meters) (Eq.2)
     """
     goal = int(action[0])
-    offset = int(action[1])
+    offset = float(action[1])  # 连续偏移值
 
     # Get ego state
     ego_trans = self.ego.get_transform()
@@ -605,9 +614,8 @@ class CarlaEnv(gym.Env):
     # Debug log
     if self.total_step % 100 == 0:
       goal_names = ['左换道', '保持', '右换道']
-      offset_names = ['偏左', '不偏', '偏右']
       err = self._last_tracking_error
-      print(f"[Step {self.total_step}] Goal={goal_names[goal]}, Offset={offset_names[offset]}, "
+      print(f"[Step {self.total_step}] Goal={goal_names[goal]}, p_off={offset:+.3f}m, "
             f"speed={ego_speed:.1f}, throttle={throttle:.2f}, steer={steer:.3f}, "
             f"lat_err={err['lateral_error']:.2f}")
 
@@ -656,7 +664,6 @@ class CarlaEnv(gym.Env):
           frenet=self.frenet,
           lane_width=self.lane_width,
           plan_horizon=cfg.PLAN_HORIZON,
-          offset_magnitude=cfg.OFFSET_MAGNITUDE,
           n_samples=cfg.BEZIER_SAMPLES,
         )
     except Exception as e:
@@ -936,10 +943,13 @@ class CarlaEnv(gym.Env):
     return False
 
   def _clear_all_actors(self, actor_filters):
-    """Clear specific actors."""
+    """Clear specific actors (batch destroy to suppress C++ error messages)."""
+    actors_to_destroy = []
     for actor_filter in actor_filters:
       for actor in self.world.get_actors().filter(actor_filter):
         if actor.is_alive:
           if actor.type_id == 'controller.ai.walker':
             actor.stop()
-          actor.destroy()
+          actors_to_destroy.append(actor.id)
+    if actors_to_destroy:
+      self.client.apply_batch([carla.command.DestroyActor(aid) for aid in actors_to_destroy])

@@ -1,22 +1,26 @@
 #!/usr/bin/env python
 """
-train_hierarchical.py — 分层强化学习 DQN 训练主脚本
+train_hierarchical.py — 分层强化学习 PPO 训练主脚本
 
 论文: A Trajectory Planning and Tracking Method Based on Deep Hierarchical RL
+算法: Proximal Policy Optimization (PPO) — 论文 HRL-TRPO 的一阶近似
 
 训练流程:
-  1. env.reset() → obs (3, 18)
-  2. HierarchicalPolicy 选择 (goal, offset) ← ε-greedy
-  3. env.step([goal, offset]) → obs', reward, done, info
-  4. 存入 ReplayBuffer
-  5. 从 ReplayBuffer 采样 mini-batch 计算 DQN loss
-  6. Q1, Q2 各自独立更新
-  7. 定期同步 Target Network
+  1. 收集 rollout_steps 步的交互数据 (on-policy)
+  2. 用 GAE 计算 advantage
+  3. PPO clip 损失更新 Q1 (离散 Categorical) + Q2 (连续 Gaussian) + Critic
+  4. 重复
+
+动作空间 (论文 §2.1.3):
+  - Q1: goal ∈ {0=左换道, 1=保持, 2=右换道} — 离散 Categorical (Eq.1)
+  - Q2: p_off ∈ ℝ                         — 连续 Gaussian    (Eq.2)
 
 使用方式:
   conda activate carla_rl
-  # 先启动 CARLA 服务器 (CarlaUE4.exe)
+  # 先启动 CARLA 服务器 (CarlaUE4.exe -quality-level=Low)
   python train_hierarchical.py
+  # 恢复训练:
+  python train_hierarchical.py --resume checkpoints/best_policy.pth
 """
 
 import glob
@@ -31,6 +35,7 @@ from collections import deque
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -62,196 +67,243 @@ from gym_carla import config as cfg
 
 
 # ======================================================================
-# Replay Buffer
+# Rollout Buffer (替代 DQN 的 ReplayBuffer)
 # ======================================================================
 
-class ReplayBuffer:
-    """Experience replay buffer for DQN training.
+class RolloutBuffer:
+    """PPO On-Policy Rollout Buffer。
 
-    Stores transitions (state, goal, offset, reward, next_state, done).
+    与 DQN ReplayBuffer 的关键区别:
+      - 不做随机重采样，使用全部数据
+      - 每次 PPO 更新后清空
+      - 存储 log_prob 和 value 用于 importance sampling ratio 计算
     """
 
-    def __init__(self, capacity: int = 100000):
-        self.buffer = deque(maxlen=capacity)
+    def __init__(self):
+        self.states = []
+        self.goals = []
+        self.offsets = []
+        self.rewards = []
+        self.dones = []
+        self.log_probs_goal = []
+        self.log_probs_offset = []
+        self.values = []
+        # 在 compute 后填充
+        self.returns = None
+        self.advantages = None
 
-    def push(self, state, goal, offset, reward, next_state, done):
-        """Store a transition.
+    def add(self, state, goal, offset, reward, done,
+            log_prob_goal, log_prob_offset, value):
+        """添加一步交互数据。"""
+        self.states.append(state.copy() if isinstance(state, np.ndarray) else state)
+        self.goals.append(goal)
+        self.offsets.append(offset)
+        self.rewards.append(reward)
+        self.dones.append(float(done))
+        self.log_probs_goal.append(log_prob_goal)
+        self.log_probs_offset.append(log_prob_offset)
+        self.values.append(value)
 
-        Args:
-            state:      np.ndarray (seq_len, state_dim)
-            goal:       int (0-2)
-            offset:     int (0-2)
-            reward:     float
-            next_state: np.ndarray (seq_len, state_dim)
-            done:       bool
+    def compute_returns_and_advantages(self, last_value, gamma, gae_lambda):
+        """用 GAE (Generalized Advantage Estimation) 计算 returns 和 advantages。
+
+        GAE 公式:
+          δ_t = r_t + γ V(s_{t+1}) (1-d_t) - V(s_t)
+          A_t = Σ_{l=0}^{T-t} (γλ)^l δ_{t+l}
+          returns_t = A_t + V(s_t)
         """
-        self.buffer.append((state, goal, offset, reward, next_state, done))
+        rewards = np.array(self.rewards, dtype=np.float32)
+        dones = np.array(self.dones, dtype=np.float32)
+        values = np.array(self.values + [last_value], dtype=np.float32)
 
-    def sample(self, batch_size: int):
-        """Sample a random mini-batch.
+        n = len(rewards)
+        advantages = np.zeros(n, dtype=np.float32)
+        last_gae = 0.0
 
-        Returns:
-            Tuple of batched tensors: (states, goals, offsets, rewards, next_states, dones)
+        for t in reversed(range(n)):
+            next_non_terminal = 1.0 - dones[t]
+            delta = rewards[t] + gamma * values[t + 1] * next_non_terminal - values[t]
+            advantages[t] = last_gae = delta + gamma * gae_lambda * next_non_terminal * last_gae
+
+        self.advantages = advantages
+        self.returns = advantages + np.array(self.values, dtype=np.float32)
+
+    def get_mini_batches(self, num_mini_batches, device='cpu'):
+        """将 rollout 数据随机分成 mini-batch 并转为 Tensor。
+
+        Yields:
+            dict of Tensors, one mini-batch at a time.
         """
-        batch = random.sample(self.buffer, min(batch_size, len(self.buffer)))
-        states, goals, offsets, rewards, next_states, dones = zip(*batch)
+        batch_size = len(self.states)
+        mini_batch_size = max(batch_size // num_mini_batches, 1)
+        indices = np.random.permutation(batch_size)
 
-        states = torch.FloatTensor(np.array(states))          # (B, seq_len, state_dim)
-        goals = torch.LongTensor(goals)                       # (B,)
-        offsets = torch.LongTensor(offsets)                    # (B,)
-        rewards = torch.FloatTensor(rewards)                   # (B,)
-        next_states = torch.FloatTensor(np.array(next_states)) # (B, seq_len, state_dim)
-        dones = torch.FloatTensor(dones)                       # (B,)
+        # 一次性转为 Tensor
+        all_states = torch.FloatTensor(np.array(self.states)).to(device)
+        all_goals = torch.LongTensor(self.goals).to(device)
+        all_offsets = torch.FloatTensor(self.offsets).to(device)
+        all_old_lp_goal = torch.FloatTensor(self.log_probs_goal).to(device)
+        all_old_lp_offset = torch.FloatTensor(self.log_probs_offset).to(device)
+        all_returns = torch.FloatTensor(self.returns).to(device)
+        all_advantages = torch.FloatTensor(self.advantages).to(device)
 
-        return states, goals, offsets, rewards, next_states, dones
+        # 归一化 advantages (PPO 标准做法)
+        all_advantages = (all_advantages - all_advantages.mean()) / (all_advantages.std() + 1e-8)
+
+        for start in range(0, batch_size, mini_batch_size):
+            end = min(start + mini_batch_size, batch_size)
+            idx = indices[start:end]
+            yield {
+                'states': all_states[idx],
+                'goals': all_goals[idx],
+                'offsets': all_offsets[idx],
+                'old_log_probs_goal': all_old_lp_goal[idx],
+                'old_log_probs_offset': all_old_lp_offset[idx],
+                'returns': all_returns[idx],
+                'advantages': all_advantages[idx],
+            }
+
+    def clear(self):
+        """清空 buffer (每次 PPO 更新后调用)。"""
+        self.__init__()
 
     def __len__(self):
-        return len(self.buffer)
+        return len(self.states)
 
 
 # ======================================================================
-# Trainer
+# PPO Trainer
 # ======================================================================
 
-class HierarchicalDQNTrainer:
-    """DQN trainer for hierarchical Q1 + Q2 networks.
+class HierarchicalPPOTrainer:
+    """PPO trainer for hierarchical Q1 (discrete) + Q2 (continuous) policy.
 
-    Each sub-network (Q1, Q2) has its own target network.
-    Both are updated with the same transition but their own TD-target.
+    损失函数:
+      L = L_clip + c1 × L_value - c2 × H
+
+      L_clip = -min(r(θ) × A, clip(r(θ), 1-ε, 1+ε) × A)
+        其中 r(θ) = π_new(a|s) / π_old(a|s) = exp(log_prob_new - log_prob_old)
+        联合 log_prob = log_prob_goal + log_prob_offset
+
+      L_value = MSE(V(s), returns)
+      H = H_goal + H_offset  (entropy bonus)
     """
 
-    def __init__(
-        self,
-        policy: HierarchicalPolicy,
-        lr: float = 3e-4,
-        gamma: float = 0.99,
-        batch_size: int = 64,
-        buffer_size: int = 100000,
-        target_update_freq: int = 100,
-        tau: float = 1.0,
-        device: str = "cpu",
-    ):
+    def __init__(self, policy, lr=3e-4, clip_epsilon=0.2,
+                 ppo_epochs=4, num_mini_batches=4,
+                 value_coef=0.5, entropy_coef=0.01,
+                 max_grad_norm=0.5, device='cpu'):
         self.policy = policy.to(device)
         self.device = device
-        self.gamma = gamma
-        self.batch_size = batch_size
-        self.target_update_freq = target_update_freq
-        self.tau = tau
+        self.clip_epsilon = clip_epsilon
+        self.ppo_epochs = ppo_epochs
+        self.num_mini_batches = num_mini_batches
+        self.value_coef = value_coef
+        self.entropy_coef = entropy_coef
+        self.max_grad_norm = max_grad_norm
 
-        # Separate optimizers for Q1 and Q2
-        self.optimizer_q1 = optim.Adam(policy.q1.parameters(), lr=lr)
-        self.optimizer_q2 = optim.Adam(policy.q2.parameters(), lr=lr)
+        # 统一优化器 (Actor Q1 + Actor Q2 + Critic)
+        self.optimizer = optim.Adam(policy.parameters(), lr=lr)
 
-        self.replay_buffer = ReplayBuffer(buffer_size)
-        self.loss_fn = nn.SmoothL1Loss()  # Huber loss
+        self.rollout = RolloutBuffer()
 
-        self.train_step = 0
+    def collect_step(self, state, goal, offset, reward, done,
+                     log_prob_goal, log_prob_offset, value):
+        """存储一步数据到 rollout buffer。"""
+        self.rollout.add(state, goal, offset, reward, done,
+                         log_prob_goal, log_prob_offset, value)
 
-    def store_transition(self, state, goal, offset, reward, next_state, done):
-        """Store a transition in the replay buffer."""
-        self.replay_buffer.push(state, goal, offset, reward, next_state, done)
+    def update(self, last_value):
+        """执行一次完整的 PPO 更新。
 
-    def update(self) -> dict:
-        """Perform one gradient update step on both Q1 and Q2.
+        Args:
+            last_value: V(s_T+1) — rollout 最后一步之后的状态价值。
 
         Returns:
-            dict with 'loss_q1', 'loss_q2', or empty if buffer too small.
+            dict: 训练统计 {policy_loss, value_loss, entropy, clip_fraction}
         """
-        if len(self.replay_buffer) < self.batch_size:
-            return {}
+        gamma = cfg.GAMMA
+        gae_lambda = cfg.GAE_LAMBDA
 
-        # Sample mini-batch
-        states, goals, offsets, rewards, next_states, dones = \
-            self.replay_buffer.sample(self.batch_size)
-        states = states.to(self.device)
-        goals = goals.to(self.device)
-        offsets = offsets.to(self.device)
-        rewards = rewards.to(self.device)
-        next_states = next_states.to(self.device)
-        dones = dones.to(self.device)
+        # 1. 计算 GAE advantages 和 returns
+        self.rollout.compute_returns_and_advantages(last_value, gamma, gae_lambda)
 
-        # --- Q1 Loss ---
-        # Current Q1 values for selected goals
-        goal_q_current, _ = self.policy.q1(states)
-        goal_q_selected = goal_q_current.gather(1, goals.unsqueeze(1)).squeeze(1)
+        # 2. 多轮 PPO epoch 更新
+        total_policy_loss = 0.0
+        total_value_loss = 0.0
+        total_entropy = 0.0
+        total_clip_frac = 0.0
+        n_updates = 0
 
-        # Target Q1 values (from target network)
-        with torch.no_grad():
-            goal_q_next, _ = self.policy.q1_target(next_states)
-            goal_q_next_max = goal_q_next.max(dim=1)[0]
-            goal_td_target = rewards + self.gamma * goal_q_next_max * (1 - dones)
+        for epoch in range(self.ppo_epochs):
+            for batch in self.rollout.get_mini_batches(
+                    self.num_mini_batches, self.device):
 
-        loss_q1 = self.loss_fn(goal_q_selected, goal_td_target)
+                # 评估当前策略下的 log_prob 和 value
+                eval_result = self.policy.evaluate_actions(
+                    batch['states'], batch['goals'], batch['offsets'])
 
-        self.optimizer_q1.zero_grad()
-        loss_q1.backward()
-        torch.nn.utils.clip_grad_norm_(self.policy.q1.parameters(), 10.0)
-        self.optimizer_q1.step()
+                new_lp_goal = eval_result['log_prob_goal']
+                new_lp_offset = eval_result['log_prob_offset']
+                entropy_goal = eval_result['entropy_goal']
+                entropy_offset = eval_result['entropy_offset']
+                new_value = eval_result['value']
 
-        # --- Q2 Loss ---
-        # Get goal one-hot for Q2 input
-        goal_onehot = torch.nn.functional.one_hot(
-            goals, self.policy.num_goals).float()
+                # --- Policy Loss (联合 ratio) ---
+                old_log_prob = batch['old_log_probs_goal'] + batch['old_log_probs_offset']
+                new_log_prob = new_lp_goal + new_lp_offset
 
-        # Current Q2 values for selected offsets
-        offset_q_current = self.policy.q2(states, goal_onehot)
-        offset_q_selected = offset_q_current.gather(
-            1, offsets.unsqueeze(1)).squeeze(1)
+                log_ratio = new_log_prob - old_log_prob
+                ratio = log_ratio.exp()
 
-        # Target Q2 values
-        with torch.no_grad():
-            # Use target Q1 to get next goal for target Q2
-            goal_q_next_target, raw_next = self.policy.q1_target(next_states)
-            next_goals = goal_q_next_target.argmax(dim=1)
-            next_goal_onehot = torch.nn.functional.one_hot(
-                next_goals, self.policy.num_goals).float()
+                advantages = batch['advantages']
 
-            offset_q_next = self.policy.q2_target(next_states, next_goal_onehot)
-            offset_q_next_max = offset_q_next.max(dim=1)[0]
-            offset_td_target = rewards + self.gamma * offset_q_next_max * (1 - dones)
+                # Clipped surrogate objective
+                surr1 = ratio * advantages
+                surr2 = torch.clamp(ratio,
+                                    1.0 - self.clip_epsilon,
+                                    1.0 + self.clip_epsilon) * advantages
+                policy_loss = -torch.min(surr1, surr2).mean()
 
-        loss_q2 = self.loss_fn(offset_q_selected, offset_td_target)
+                # Clip fraction (诊断指标)
+                with torch.no_grad():
+                    clip_frac = ((ratio - 1.0).abs() > self.clip_epsilon).float().mean()
 
-        self.optimizer_q2.zero_grad()
-        loss_q2.backward()
-        torch.nn.utils.clip_grad_norm_(self.policy.q2.parameters(), 10.0)
-        self.optimizer_q2.step()
+                # --- Value Loss ---
+                value_loss = F.mse_loss(new_value, batch['returns'])
 
-        # --- Target network update ---
-        self.train_step += 1
-        if self.train_step % self.target_update_freq == 0:
-            self.policy.update_target(tau=self.tau)
+                # --- Entropy Bonus ---
+                entropy = entropy_goal.mean() + entropy_offset.mean()
+
+                # --- Total Loss ---
+                loss = (policy_loss
+                        + self.value_coef * value_loss
+                        - self.entropy_coef * entropy)
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                self.optimizer.step()
+
+                total_policy_loss += policy_loss.item()
+                total_value_loss += value_loss.item()
+                total_entropy += entropy.item()
+                total_clip_frac += clip_frac.item()
+                n_updates += 1
+
+        # 3. 清空 rollout buffer
+        self.rollout.clear()
 
         return {
-            'loss_q1': loss_q1.item(),
-            'loss_q2': loss_q2.item(),
+            'policy_loss': total_policy_loss / max(n_updates, 1),
+            'value_loss': total_value_loss / max(n_updates, 1),
+            'entropy': total_entropy / max(n_updates, 1),
+            'clip_fraction': total_clip_frac / max(n_updates, 1),
         }
 
 
 # ======================================================================
-# Epsilon schedule
-# ======================================================================
-
-def get_epsilon(episode: int, total_episodes: int,
-                eps_start: float = 1.0, eps_end: float = 0.05,
-                eps_decay_frac: float = 0.5) -> float:
-    """Linear epsilon decay schedule.
-
-    Args:
-        episode:        Current episode.
-        total_episodes: Total episodes.
-        eps_start:      Starting epsilon.
-        eps_end:        Minimum epsilon.
-        eps_decay_frac: Fraction of total episodes over which to decay.
-    """
-    decay_episodes = int(total_episodes * eps_decay_frac)
-    if episode >= decay_episodes:
-        return eps_end
-    return eps_start - (eps_start - eps_end) * episode / decay_episodes
-
-
-# ======================================================================
-# Main training loop
+# Environment setup
 # ======================================================================
 
 def make_env_params():
@@ -291,8 +343,19 @@ def make_env_params():
     }
 
 
-def train(resume_path: str = None):
-    """Main training entry point."""
+# ======================================================================
+# Main PPO training loop
+# ======================================================================
+
+def train(resume_path=None):
+    """PPO 训练主入口。
+
+    与 DQN 的关键区别:
+      - 基于 step 的 on-policy 数据收集 (非 episode)
+      - 每收集 rollout_steps 步后做 PPO 更新
+      - 无 replay buffer / target network
+      - 使用 GAE + clip surrogate objective
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training device: {device}")
 
@@ -301,42 +364,49 @@ def train(resume_path: str = None):
     params = make_env_params()
     env = gym.make('carla-v0', params=params)
 
-    # Create policy
+    # Create policy (Actor-Critic)
     policy = HierarchicalPolicy(
         state_dim=cfg.STATE_DIM,
         seq_len=cfg.SEQ_LEN,
         hidden_dim=cfg.HIDDEN_DIM,
         num_goals=cfg.NUM_GOALS,
-        num_offsets=cfg.NUM_OFFSETS,
+        log_std_init=cfg.OFFSET_LOG_STD_INIT,
     )
 
-    # Create trainer
-    trainer = HierarchicalDQNTrainer(
+    # Create PPO trainer
+    trainer = HierarchicalPPOTrainer(
         policy=policy,
         lr=cfg.LEARNING_RATE,
-        gamma=cfg.GAMMA,
-        batch_size=cfg.BATCH_SIZE,
-        buffer_size=cfg.REPLAY_BUFFER_SIZE,
-        target_update_freq=cfg.TARGET_UPDATE_FREQ,
-        tau=1.0,   # Hard update
+        clip_epsilon=cfg.PPO_CLIP_EPSILON,
+        ppo_epochs=cfg.PPO_EPOCHS,
+        num_mini_batches=cfg.NUM_MINI_BATCHES,
+        value_coef=cfg.VALUE_COEF,
+        entropy_coef=cfg.ENTROPY_COEF,
+        max_grad_norm=cfg.MAX_GRAD_NORM,
         device=device,
     )
 
     # Resume from checkpoint
-    start_episode = 0
+    start_iteration = 0
+    total_steps = 0
+    episode_num = 0
     if resume_path and os.path.exists(resume_path):
-        print(f"Resuming training from: {resume_path}")
-        checkpoint = torch.load(resume_path, map_location=device)
-        policy.load_state_dict(checkpoint['policy_state_dict'])
-        trainer.optimizer_q1.load_state_dict(checkpoint['optimizer_q1'])
-        trainer.optimizer_q2.load_state_dict(checkpoint['optimizer_q2'])
-        start_episode = checkpoint['episode'] + 1
-        if 'avg_reward' in checkpoint:
-            print(f"  Last avg_reward: {checkpoint['avg_reward']:.2f}")
+        print(f"Resuming from: {resume_path}")
+        ckpt = torch.load(resume_path, map_location=device)
+        policy.load_state_dict(ckpt['policy_state_dict'])
+        if 'optimizer_state_dict' in ckpt:
+            trainer.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        start_iteration = ckpt.get('iteration', 0) + 1
+        total_steps = ckpt.get('total_steps', 0)
+        if 'avg_reward' in ckpt:
+            print(f"  Last avg_reward: {ckpt['avg_reward']:.2f}")
+        print(f"  Resuming at iteration {start_iteration}, total_steps={total_steps}")
 
-    # Training loop
-    num_episodes = cfg.NUM_EPISODES
+    # Training config
+    rollout_steps = cfg.ROLLOUT_STEPS
+    num_iterations = cfg.NUM_ITERATIONS
     max_steps = cfg.MAX_STEPS_PER_EPISODE
+    offset_range = cfg.OFFSET_RANGE
 
     # Logging
     episode_rewards = deque(maxlen=100)
@@ -346,120 +416,171 @@ def train(resume_path: str = None):
 
     # TensorBoard
     log_dir = os.path.join(os.path.dirname(__file__), 'runs',
-                           time.strftime('DQN_%Y%m%d_%H%M%S'))
+                           time.strftime('PPO_%Y%m%d_%H%M%S'))
     writer = SummaryWriter(log_dir) if HAS_TENSORBOARD else None
     if writer:
         print(f"  TensorBoard log: {log_dir}")
         print(f"  启动命令: tensorboard --logdir={os.path.dirname(log_dir)}")
 
+    # Print config
+    params_count = policy.count_parameters()
     print(f"\n{'='*60}")
-    print(f"Training Config:")
-    print(f"  Episodes:       {num_episodes}")
-    print(f"  Max steps/ep:   {max_steps}")
-    print(f"  Batch size:     {cfg.BATCH_SIZE}")
+    print(f"PPO Training Config:")
+    print(f"  Iterations:     {num_iterations}")
+    print(f"  Rollout steps:  {rollout_steps}")
+    print(f"  PPO epochs:     {cfg.PPO_EPOCHS}")
+    print(f"  Mini-batches:   {cfg.NUM_MINI_BATCHES}")
+    print(f"  Clip epsilon:   {cfg.PPO_CLIP_EPSILON}")
     print(f"  LR:             {cfg.LEARNING_RATE}")
     print(f"  Gamma:          {cfg.GAMMA}")
-    print(f"  Buffer size:    {cfg.REPLAY_BUFFER_SIZE}")
-    print(f"  Target update:  every {cfg.TARGET_UPDATE_FREQ} steps")
-    params_count = policy.count_parameters()
-    print(f"  Q1 params:      {params_count['q1']:,}")
-    print(f"  Q2 params:      {params_count['q2']:,}")
+    print(f"  GAE lambda:     {cfg.GAE_LAMBDA}")
+    print(f"  Value coef:     {cfg.VALUE_COEF}")
+    print(f"  Entropy coef:   {cfg.ENTROPY_COEF}")
+    print(f"  Offset range:   +/-{offset_range}m (continuous)")
+    print(f"  Q1 Actor:       {params_count['q1_actor']:,} params")
+    print(f"  Q2 Actor:       {params_count['q2_actor']:,} params")
+    print(f"  Critic:         {params_count['critic']:,} params")
+    print(f"  Total:          {params_count['total']:,} params")
+    print(f"  Est. total steps: ~{num_iterations * rollout_steps:,}")
     print(f"{'='*60}\n")
 
-    for episode in range(start_episode, num_episodes):
-        obs = env.reset()
-        episode_reward = 0.0
-        epsilon = get_epsilon(episode, num_episodes)
+    # ==========================================
+    # Training loop (step-based, PPO on-policy)
+    # ==========================================
+    episode_reward = 0.0
+    episode_steps = 0
+    obs = env.reset()
 
-        for step in range(max_steps):
-            # State to tensor
+    for iteration in range(start_iteration, num_iterations):
+        iter_start = time.time()
+
+        # --- Phase 1: Collect rollout ---
+        policy.eval()
+        for step in range(rollout_steps):
             state_tensor = torch.FloatTensor(obs).to(device)
 
-            # Select action
-            goal, offset = policy.select_action(state_tensor, epsilon=epsilon)
+            # 从策略分布中采样动作
+            action_info = policy.select_action(state_tensor)
+            goal = action_info['goal']
+            p_off_raw = action_info['offset']
 
-            # Environment step
-            next_obs, reward, done, info = env.step([goal, offset])
+            # Clip offset 到合理范围
+            p_off = float(np.clip(p_off_raw, -offset_range, offset_range))
 
-            # Store transition
-            trainer.store_transition(obs, goal, offset, reward, next_obs, float(done))
+            # 环境交互
+            next_obs, reward, done, info = env.step([goal, p_off])
 
-            # Update networks
-            losses = trainer.update()
+            # 存储到 rollout buffer (存储原始采样值以保持 log_prob 一致性)
+            trainer.collect_step(
+                state=obs,
+                goal=goal,
+                offset=p_off_raw,
+                reward=reward,
+                done=done,
+                log_prob_goal=action_info['log_prob_goal'],
+                log_prob_offset=action_info['log_prob_offset'],
+                value=action_info['value'],
+            )
 
             episode_reward += reward
+            episode_steps += 1
+            total_steps += 1
             obs = next_obs
 
-            if done:
-                break
+            if done or episode_steps >= max_steps:
+                episode_num += 1
+                episode_rewards.append(episode_reward)
 
-        episode_rewards.append(episode_reward)
-        avg_reward = np.mean(episode_rewards)
+                if writer:
+                    writer.add_scalar('reward/episode', episode_reward, episode_num)
+                    writer.add_scalar('train/steps_per_episode', episode_steps, episode_num)
 
-        # TensorBoard logging (every episode)
+                episode_reward = 0.0
+                episode_steps = 0
+                obs = env.reset()
+
+        # --- Phase 2: Compute last value for GAE ---
+        state_tensor = torch.FloatTensor(obs).to(device)
+        last_value = policy.get_value(state_tensor)
+
+        # --- Phase 3: PPO update ---
+        policy.train()
+        losses = trainer.update(last_value)
+
+        iter_time = time.time() - iter_start
+        avg_reward = np.mean(episode_rewards) if len(episode_rewards) > 0 else 0.0
+
+        # --- TensorBoard logging ---
         if writer:
-            writer.add_scalar('reward/episode', episode_reward, episode)
-            writer.add_scalar('reward/avg100', avg_reward, episode)
-            writer.add_scalar('train/epsilon', epsilon, episode)
-            writer.add_scalar('train/steps_per_episode', step + 1, episode)
-            if losses:
-                writer.add_scalar('loss/Q1', losses.get('loss_q1', 0), episode)
-                writer.add_scalar('loss/Q2', losses.get('loss_q2', 0), episode)
-            writer.add_scalar('train/buffer_size', len(trainer.replay_buffer), episode)
+            writer.add_scalar('reward/avg100', avg_reward, iteration)
+            writer.add_scalar('loss/policy', losses['policy_loss'], iteration)
+            writer.add_scalar('loss/value', losses['value_loss'], iteration)
+            writer.add_scalar('loss/entropy', losses['entropy'], iteration)
+            writer.add_scalar('train/clip_fraction', losses['clip_fraction'], iteration)
+            writer.add_scalar('train/total_steps', total_steps, iteration)
+            writer.add_scalar('train/episodes', episode_num, iteration)
+            writer.add_scalar('train/q2_log_std', policy.q2.log_std.item(), iteration)
+            writer.add_scalar('train/q2_std', policy.q2.log_std.exp().item(), iteration)
 
-        # Console logging
-        if episode % 10 == 0 or episode == num_episodes - 1:
-            loss_str = ""
-            if losses:
-                loss_str = f", Q1_loss={losses.get('loss_q1', 0):.4f}, Q2_loss={losses.get('loss_q2', 0):.4f}"
-            print(f"[Ep {episode:4d}/{num_episodes}] "
-                  f"reward={episode_reward:7.1f}, avg100={avg_reward:7.1f}, "
-                  f"eps={epsilon:.3f}, steps={step+1}{loss_str}")
+        # --- Console logging ---
+        if iteration % 5 == 0 or iteration == num_iterations - 1:
+            print(f"[Iter {iteration:4d}/{num_iterations}] "
+                  f"ep={episode_num}, steps={total_steps}, "
+                  f"avg_r={avg_reward:7.1f}, "
+                  f"pi={losses['policy_loss']:.4f}, "
+                  f"v={losses['value_loss']:.4f}, "
+                  f"H={losses['entropy']:.3f}, "
+                  f"clip={losses['clip_fraction']:.3f}, "
+                  f"sigma={policy.q2.log_std.exp().item():.3f}, "
+                  f"{iter_time:.1f}s")
 
-        # Save best model
+        # --- Save best model ---
         if avg_reward > best_avg_reward and len(episode_rewards) >= 20:
             best_avg_reward = avg_reward
             save_path = os.path.join(save_dir, 'best_policy.pth')
             torch.save({
-                'episode': episode,
+                'iteration': iteration,
                 'policy_state_dict': policy.state_dict(),
-                'optimizer_q1': trainer.optimizer_q1.state_dict(),
-                'optimizer_q2': trainer.optimizer_q2.state_dict(),
+                'optimizer_state_dict': trainer.optimizer.state_dict(),
                 'avg_reward': avg_reward,
+                'total_steps': total_steps,
             }, save_path)
             print(f"  >> Saved best model (avg_reward={avg_reward:.1f})")
 
-        # Periodic checkpoint
-        if episode % 500 == 0 and episode > 0:
-            ckpt_path = os.path.join(save_dir, f'policy_ep{episode}.pth')
+        # --- Periodic checkpoint ---
+        if iteration % 50 == 0 and iteration > 0:
+            ckpt_path = os.path.join(save_dir, f'policy_iter{iteration}.pth')
             torch.save({
-                'episode': episode,
+                'iteration': iteration,
                 'policy_state_dict': policy.state_dict(),
-                'optimizer_q1': trainer.optimizer_q1.state_dict(),
-                'optimizer_q2': trainer.optimizer_q2.state_dict(),
+                'optimizer_state_dict': trainer.optimizer.state_dict(),
                 'avg_reward': avg_reward,
+                'total_steps': total_steps,
             }, ckpt_path)
-            print(f"  >> Checkpoint saved: {ckpt_path}")
+            print(f"  >> Checkpoint: {ckpt_path}")
 
     # Final save
     final_path = os.path.join(save_dir, 'final_policy.pth')
     torch.save({
-        'episode': num_episodes,
+        'iteration': num_iterations,
         'policy_state_dict': policy.state_dict(),
         'avg_reward': avg_reward,
+        'total_steps': total_steps,
     }, final_path)
-    print(f"\nTraining complete! Final model saved to {final_path}")
+    print(f"\nTraining complete! Final model: {final_path}")
+    print(f"  Total steps: {total_steps:,}, Episodes: {episode_num}")
 
     if writer:
         writer.close()
-        print(f"TensorBoard logs saved to: {log_dir}")
+        print(f"TensorBoard logs: {log_dir}")
 
     env.close()
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume from')
+    parser = argparse.ArgumentParser(description='Hierarchical PPO Training')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to checkpoint to resume from')
     args = parser.parse_args()
-    
+
     train(resume_path=args.resume)

@@ -18,7 +18,7 @@ SEQ_LEN = 3                 # 过去 3 个采样时刻 (论文 §2.2.1)
 # ==============================================================
 HIDDEN_DIM = 64             # LSTM 隐藏层维度
 NUM_GOALS = 3               # Q1 输出: 左换道 / 保持 / 右换道
-NUM_OFFSETS = 3              # Q2 输出: 偏左 / 不偏 / 偏右
+# Q2 输出: 连续偏移值 p_off ∈ [-OFFSET_RANGE, OFFSET_RANGE] (论文 Eq.2)
 
 # ==============================================================
 # Zone Detection (论文 §2.1.2, Figure 2)
@@ -34,7 +34,7 @@ DEFAULT_REL_DIST = 100.0     # 区域内无车时的默认相对距离 (m)
 # Planning (论文 §2.2.2)
 # ==============================================================
 PLAN_HORIZON = 30.0          # 贝塞尔曲线纵向规划距离 (m)
-OFFSET_MAGNITUDE = 0.5       # Q2 偏移步长 (m)
+OFFSET_RANGE = 2.0           # Q2 连续偏移最大范围 (m), |p_off| ≤ OFFSET_RANGE
 BEZIER_SAMPLES = 50          # 轨迹采样点数
 
 # ==============================================================
@@ -46,15 +46,21 @@ LOOKAHEAD_DIST = 5.0         # Pure Pursuit 基础前视距离 (m)
 CONTROL_DT = 0.1             # 控制周期 (s), 与 CARLA 同步步长一致
 
 # ==============================================================
-# Training
+# Training — PPO (Proximal Policy Optimization)
 # ==============================================================
 LEARNING_RATE = 3e-4
 GAMMA = 0.99                 # 折扣因子
-BATCH_SIZE = 64
-REPLAY_BUFFER_SIZE = 100000
-NUM_EPISODES = 5000
-MAX_STEPS_PER_EPISODE = 500
-TARGET_UPDATE_FREQ = 100     # Target network 更新频率
+GAE_LAMBDA = 0.95            # GAE λ (Generalized Advantage Estimation)
+PPO_CLIP_EPSILON = 0.2       # PPO clip ratio ε
+PPO_EPOCHS = 4               # 每次 rollout 后的 PPO 更新轮数
+NUM_MINI_BATCHES = 4         # 每轮分成的 mini-batch 数量
+VALUE_COEF = 0.5             # Value loss 系数 c1
+ENTROPY_COEF = 0.01          # Entropy bonus 系数 c2
+MAX_GRAD_NORM = 0.5          # 梯度裁剪范数
+ROLLOUT_STEPS = 1024         # 每次收集的交互步数
+NUM_ITERATIONS = 300         # PPO 迭代次数 (总步数 ≈ ROLLOUT_STEPS × NUM_ITERATIONS)
+MAX_STEPS_PER_EPISODE = 500  # 单 episode 最大步数
+OFFSET_LOG_STD_INIT = 0.0    # Q2 高斯策略初始 log(σ)
 
 # ==============================================================
 # Reward Function 

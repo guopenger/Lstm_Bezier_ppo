@@ -1,63 +1,63 @@
 #!/usr/bin/env python
 """
-q2_decision.py — Q² 下层轨迹偏移决策模型
+q2_decision.py — Q² 下层轨迹偏移决策模型 (Gaussian Actor — 连续动作)
 
-论文依据 (§2.2.1, Figure 3):
+论文依据 (§2.2.1, Figure 3, §2.1.3 Eq.2):
   Q2 的输入是 **原始环境输入 (Skip Connection)** 与 **Q1 的 Goal** 的拼接。
   这是论文的关键设计: "concatenate the input and the output of Q1 as the input
   of the lower decision model"。
+
+  动作空间 (论文 Eq.2):
+    A_p = [p_off]  — 单个连续值！
+    p_off 表示轨迹的横向偏移量 (meters)，不是离散档位。
 
   架构:
     Input = Concat(Original_State_flat, Goal_onehot)
           = Concat((batch, 54), (batch, 3))
           = (batch, 57)
-    → unsqueeze → (batch, 1, 57)  [单步 LSTM 输入]
+    → unsqueeze → (batch, 1, 57)
     → LSTM(input_size=57, hidden_size=64)
-    → FC(64→32) → ReLU → FC(32→3)
-    → Offset Q-values (batch, 3)
-
-  Offset 映射:
-    0 = 偏左 (+offset_magnitude)
-    1 = 不偏 (0)
-    2 = 偏右 (-offset_magnitude)
+    → FC(64→32) → ReLU → FC(32→1) → mean μ
+    → 高斯策略: p_off ~ N(μ, σ²)，σ 为可学习参数
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributions import Normal
 
 
 class Q2Decision(nn.Module):
-    """Q² 下层轨迹偏移决策网络。
+    """Q² 下层轨迹偏移决策网络 — 连续高斯策略。
 
     ★ 关键修正 ★
-      原错误设计: Q2 Input = Concat(Q1_hidden_h, Goal)    → 67维
-      论文正确:   Q2 Input = Concat(Original_Input_flat, Goal) → 57维
-      即 Q2 通过 Skip Connection 直接接收原始环境观测。
+      1. Skip Connection: Q2 直接接收原始环境观测 (非 Q1 隐状态)
+      2. 连续输出: 输出高斯分布 N(μ, σ²) 而非离散 Q 值
 
     Architecture:
         Concat(state_flat(54), goal_onehot(3)) = 57
         → LSTM(57, 64) single step
-        → FC(64→32) → ReLU → FC(32→3)
+        → FC(64→32) → ReLU → FC(32→1) → μ
+        + learnable log_std → σ = exp(log_std)
+        → p_off ~ N(μ, σ²)
     """
 
     def __init__(self, state_dim: int = 18, seq_len: int = 3,
                  hidden_dim: int = 64, num_goals: int = 3,
-                 num_offsets: int = 3):
+                 log_std_init: float = 0.0):
         """
         Args:
-            state_dim:   单步状态维度 (18)。
-            seq_len:     时间步数 (3)。
-            hidden_dim:  LSTM 隐藏层维度 (64)。
-            num_goals:   Q1 输出类别数 (3)，用于 one-hot 编码。
-            num_offsets: Q2 输出类别数 (3 — 偏左/不偏/偏右)。
+            state_dim:    单步状态维度 (18)。
+            seq_len:      时间步数 (3)。
+            hidden_dim:   LSTM 隐藏层维度 (64)。
+            num_goals:    Q1 输出类别数 (3)，用于 one-hot 编码。
+            log_std_init: 高斯策略初始 log(σ)，0.0 表示初始 σ=1.0。
         """
         super().__init__()
         self.state_dim = state_dim
         self.seq_len = seq_len
         self.hidden_dim = hidden_dim
         self.num_goals = num_goals
-        self.num_offsets = num_offsets
 
         # Skip Connection 后的拼接维度
         # state_flat = state_dim × seq_len = 18 × 3 = 54
@@ -73,16 +73,20 @@ class Q2Decision(nn.Module):
             batch_first=True,
         )
 
-        # FC Head: LSTM 输出 → Offset Q-values
-        self.fc = nn.Sequential(
+        # FC Head: LSTM 输出 → 连续偏移量均值 μ
+        self.fc_mean = nn.Sequential(
             nn.Linear(hidden_dim, 32),
             nn.ReLU(),
-            nn.Linear(32, num_offsets),
+            nn.Linear(32, 1),
         )
+
+        # 可学习的对数标准差 log(σ)
+        # 初始 log_std=0 → σ=1.0，训练过程中自动调整探索程度
+        self.log_std = nn.Parameter(torch.full((1,), log_std_init))
 
     def forward(self, original_state_seq: torch.Tensor,
                 goal_onehot: torch.Tensor) -> torch.Tensor:
-        """前向推理。
+        """前向推理，输出高斯分布的均值 μ。
 
         Args:
             original_state_seq: (batch, seq_len=3, state_dim=18)
@@ -91,7 +95,7 @@ class Q2Decision(nn.Module):
                                 Q1 输出的 Goal one-hot 编码。
 
         Returns:
-            offset_q_values: (batch, 3) Offset Q 值。
+            mean: (batch,) 偏移量均值 μ。
         """
         batch_size = original_state_seq.size(0)
 
@@ -110,30 +114,57 @@ class Q2Decision(nn.Module):
         # 取输出: (batch, 1, 64) → (batch, 64)
         last_hidden = lstm_out.squeeze(1)
 
-        # FC 映射到 Offset Q-values
-        offset_q_values = self.fc(last_hidden)  # (batch, 3)
+        # FC 映射到均值 μ: (batch, 64) → (batch, 1) → (batch,)
+        mean = self.fc_mean(last_hidden).squeeze(-1)
 
-        return offset_q_values
+        return mean
 
-    def get_offset_probs(self, original_state_seq: torch.Tensor,
+    # ------------------------------------------------------------------
+    # PPO 接口
+    # ------------------------------------------------------------------
+
+    def get_dist(self, original_state_seq: torch.Tensor,
+                 goal_onehot: torch.Tensor):
+        """获取 Offset 的高斯分布 N(μ, σ²)。
+
+        Returns:
+            Normal 分布对象。
+        """
+        mean = self.forward(original_state_seq, goal_onehot)
+        std = self.log_std.exp().expand_as(mean)
+        return Normal(mean, std)
+
+    def evaluate_actions(self, original_state_seq: torch.Tensor,
                          goal_onehot: torch.Tensor,
-                         temperature: float = 1.0) -> torch.Tensor:
-        """获取 Offset 的 Softmax 概率分布。"""
-        q_values = self.forward(original_state_seq, goal_onehot)
-        return F.softmax(q_values / temperature, dim=-1)
+                         actions: torch.Tensor):
+        """评估给定连续动作的 log_prob 和 entropy (PPO 更新用)。
+
+        Args:
+            original_state_seq: (batch, seq_len, state_dim)。
+            goal_onehot:        (batch, num_goals)。
+            actions:            (batch,) FloatTensor, 连续偏移值。
+
+        Returns:
+            log_probs: (batch,) 动作对数概率。
+            entropy:   (batch,) 策略熵。
+        """
+        dist = self.get_dist(original_state_seq, goal_onehot)
+        log_probs = dist.log_prob(actions)
+        entropy = dist.entropy()
+        return log_probs, entropy
 
     def select_action(self, original_state_seq: torch.Tensor,
-                      goal_onehot: torch.Tensor,
-                      epsilon: float = 0.0) -> torch.Tensor:
-        """ε-greedy 动作选择。"""
-        q_values = self.forward(original_state_seq, goal_onehot)
+                      goal_onehot: torch.Tensor):
+        """从高斯策略中采样偏移量 (PPO 训练用)。
 
-        if epsilon > 0 and torch.rand(1).item() < epsilon:
-            return torch.randint(0, self.num_offsets,
-                                 (original_state_seq.size(0),),
-                                 device=original_state_seq.device)
-        else:
-            return q_values.argmax(dim=-1)
+        Returns:
+            p_off:    (batch,) 采样的连续偏移值。
+            log_prob: (batch,) 对数概率。
+        """
+        dist = self.get_dist(original_state_seq, goal_onehot)
+        p_off = dist.sample()
+        log_prob = dist.log_prob(p_off)
+        return p_off, log_prob
 
 
 # ======================================================================
@@ -141,13 +172,14 @@ class Q2Decision(nn.Module):
 # ======================================================================
 if __name__ == "__main__":
     print("=" * 50)
-    print("Q2Decision Self-Test")
+    print("Q2Decision Self-Test (PPO Gaussian Actor)")
     print("=" * 50)
 
     model = Q2Decision(state_dim=18, seq_len=3, hidden_dim=64,
-                        num_goals=3, num_offsets=3)
+                       num_goals=3, log_std_init=0.0)
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
     print(f"Concat dim: {model.concat_dim} (expect 57 = 18×3 + 3)")
+    print(f"Initial σ:  {model.log_std.exp().item():.4f} (expect 1.0)")
 
     # 模拟 Q1 的输出
     batch = 4
@@ -155,14 +187,26 @@ if __name__ == "__main__":
     goal_onehot = torch.zeros(batch, 3)
     goal_onehot[:, 1] = 1.0                      # 全部选"保持"
 
-    q_values = model(raw_input, goal_onehot)
-    probs = model.get_offset_probs(raw_input, goal_onehot)
-    action = model.select_action(raw_input, goal_onehot, epsilon=0.1)
-
+    # forward → mean
+    mean = model(raw_input, goal_onehot)
     print(f"\nRaw input shape:    {raw_input.shape}")
     print(f"Goal onehot shape:  {goal_onehot.shape}")
-    print(f"Q-values shape:     {q_values.shape}  (expect [4, 3])")
-    print(f"Probs shape:        {probs.shape}     (expect [4, 3])")
-    print(f"Probs sum:          {probs.sum(dim=-1).tolist()}")
-    print(f"Action shape:       {action.shape}    (expect [4])")
-    print(f"Actions:            {action.tolist()}")
+    print(f"Mean shape:         {mean.shape}  (expect [4])")
+    print(f"Mean values:        {mean.detach().tolist()}")
+
+    # 采样
+    p_off, lp = model.select_action(raw_input, goal_onehot)
+    print(f"Sampled p_off:      {p_off.tolist()}")
+    print(f"Log probs:          {lp.tolist()}")
+
+    # evaluate
+    lp2, ent = model.evaluate_actions(raw_input, goal_onehot, p_off)
+    print(f"Eval log_probs:     {lp2.tolist()}")
+    print(f"Entropy:            {ent.tolist()}")
+
+    # 高斯分布验证
+    dist = model.get_dist(raw_input, goal_onehot)
+    print(f"Dist mean:          {dist.mean.tolist()}")
+    print(f"Dist std:           {dist.stddev.tolist()}")
+
+    print("\n✓ Q2Decision (PPO Gaussian) test passed!")

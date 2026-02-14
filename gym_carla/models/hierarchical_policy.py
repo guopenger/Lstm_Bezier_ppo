@@ -1,240 +1,237 @@
 #!/usr/bin/env python
 """
-hierarchical_policy.py — 分层决策策略网络 (封装 Q1 + Q2)
+hierarchical_policy.py — 分层决策策略网络 (PPO Actor-Critic)
 
 论文依据 (§2.2.1, Figure 3):
   整体前向流:
-    State(N, 3, 18) → Q1(LSTM₁+FC) → Goal
+    State(N, 3, 18) → Q1(LSTM₁+FC) → Softmax → Goal (离散 Categorical)
                  ↓ Skip Connection
-    Concat(State_flat, Goal_onehot) → Q2(LSTM₂+FC) → Offset
+    Concat(State_flat, Goal_onehot) → Q2(LSTM₂+FC) → μ → p_off (连续 Gaussian)
 
-  训练模式:
-    - DQN: Q1 和 Q2 各自有独立的 Target Network
-    - 或 Actor-Critic: Softmax 概率用于 policy gradient
+  训练模式 — PPO:
+    - Q1 输出分类概率 (Categorical) — 离散行为决策 (Eq.1)
+    - Q2 输出高斯均值+标准差 (Normal) — 连续轨迹偏移 (Eq.2)
+    - Critic: LSTM → V(s) 状态价值估计
 
   部署模式:
-    - 导出 ONNX: forward() 直接输出 (goal_idx, offset_idx)
-
-本模块同时封装:
-  - Online Network (用于选动作 + 计算当前 Q 值)
-  - Target Network (用于计算 TD-target，定期从 Online 拷贝参数)
+    - 导出 ONNX: Q1 → argmax(goal), Q2 → mean(p_off)
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from copy import deepcopy
+from torch.distributions import Categorical
 
 from gym_carla.models.q1_decision import Q1Decision
 from gym_carla.models.q2_decision import Q2Decision
+from gym_carla.models.critic import CriticNetwork
 
 
 class HierarchicalPolicy(nn.Module):
-    """分层决策网络: Q1 (行为) + Q2 (轨迹偏移)。
+    """分层决策网络: Q1 (行为 Actor) + Q2 (偏移 Actor) + Critic。
 
     数据流:
         state_seq (batch, 3, 18)
             ↓
-        Q1 → goal_q_values (batch, 3) + raw_input (skip)
-            ↓
+        Q1 → Categorical(logits) → sample goal ∈ {0,1,2}
+            ↓ Skip Connection
         goal → one_hot → concat with raw_input_flat
             ↓
-        Q2 → offset_q_values (batch, 3)
+        Q2 → Normal(μ, σ) → sample p_off ∈ ℝ
+            ↓
+        Critic(state_seq) → V(s) 状态价值
 
     提供:
-        - forward():         获取双层 Q 值
-        - select_action():   ε-greedy 选动作
-        - get_probs():       Softmax 概率 (可视化/部署)
-        - export_onnx():     导出为 ONNX 文件
+        - select_action():     采样动作 (训练时带探索)
+        - evaluate_actions():  评估已有动作 (PPO 更新)
+        - get_value():         仅获取 V(s) (GAE 末步)
+        - export_onnx():       导出为 ONNX 文件
     """
 
     def __init__(self, state_dim: int = 18, seq_len: int = 3,
                  hidden_dim: int = 64, num_goals: int = 3,
-                 num_offsets: int = 3):
+                 log_std_init: float = 0.0):
+        """
+        Args:
+            state_dim:    单步状态维度 (18)。
+            seq_len:      时间步长 (3)。
+            hidden_dim:   LSTM 隐藏层维度 (64)。
+            num_goals:    Q1 输出类别数 (3)。
+            log_std_init: Q2 高斯策略初始 log(σ)。
+        """
         super().__init__()
         self.state_dim = state_dim
         self.seq_len = seq_len
         self.num_goals = num_goals
-        self.num_offsets = num_offsets
 
-        # Online Networks
+        # Actor 网络
         self.q1 = Q1Decision(state_dim, seq_len, hidden_dim, num_goals)
-        self.q2 = Q2Decision(state_dim, seq_len, hidden_dim, num_goals, num_offsets)
+        self.q2 = Q2Decision(state_dim, seq_len, hidden_dim, num_goals,
+                             log_std_init=log_std_init)
 
-        # Target Networks (延迟更新，用于 DQN 稳定训练)
-        self.q1_target = deepcopy(self.q1)
-        self.q2_target = deepcopy(self.q2)
-        # 冻结 target 参数
-        for p in self.q1_target.parameters():
-            p.requires_grad = False
-        for p in self.q2_target.parameters():
-            p.requires_grad = False
+        # Critic 网络 (独立 LSTM + FC, 估计 V(s))
+        self.critic = CriticNetwork(state_dim, seq_len, hidden_dim)
 
     # ------------------------------------------------------------------
-    # 核心前向
-    # ------------------------------------------------------------------
-
-    def forward(self, state_seq: torch.Tensor,
-                use_target: bool = False) -> dict:
-        """完整的分层前向推理。
-
-        Args:
-            state_seq:  (batch, seq_len=3, state_dim=18)。
-            use_target: True 时使用 Target Network (计算 TD-target)。
-
-        Returns:
-            dict:
-                'goal_q':      (batch, 3) Q1 的 Q 值。
-                'offset_q':    (batch, 3) Q2 的 Q 值。
-                'goal_idx':    (batch,)   贪心选择的 Goal 索引。
-                'offset_idx':  (batch,)   贪心选择的 Offset 索引。
-                'goal_onehot': (batch, 3) Goal 的 one-hot 编码。
-        """
-        q1_net = self.q1_target if use_target else self.q1
-        q2_net = self.q2_target if use_target else self.q2
-
-        # Q1: 行为决策
-        goal_q, raw_input = q1_net(state_seq)
-        goal_idx = goal_q.argmax(dim=-1)  # (batch,)
-
-        # Goal → one-hot
-        goal_onehot = F.one_hot(goal_idx, self.num_goals).float()  # (batch, 3)
-
-        # Q2: 轨迹偏移 (Skip Connection: 使用原始输入)
-        offset_q = q2_net(raw_input, goal_onehot)
-        offset_idx = offset_q.argmax(dim=-1)  # (batch,)
-
-        return {
-            'goal_q': goal_q,
-            'offset_q': offset_q,
-            'goal_idx': goal_idx,
-            'offset_idx': offset_idx,
-            'goal_onehot': goal_onehot,
-        }
-
-    # ------------------------------------------------------------------
-    # 动作选择
+    # 动作选择 (训练 + 推理)
     # ------------------------------------------------------------------
 
     def select_action(self, state_seq: torch.Tensor,
-                      epsilon: float = 0.0) -> tuple:
-        """ε-greedy 双层动作选择。
+                      deterministic: bool = False) -> dict:
+        """采样分层动作。
 
         Args:
-            state_seq: (batch, seq_len, state_dim) 或 (seq_len, state_dim)。
-            epsilon:   探索概率。
+            state_seq: (seq_len, state_dim) 单样本 或 (batch, seq_len, state_dim)。
+            deterministic: True 时使用 argmax/mean (测试/部署)。
 
         Returns:
-            (goal_idx, offset_idx): 各为 int (单样本) 或 Tensor (批量)。
+            dict: {
+              'goal': int,              # 离散 goal 索引
+              'offset': float,          # 连续 p_off 偏移量
+              'log_prob_goal': float,   # goal 的对数概率
+              'log_prob_offset': float, # p_off 的对数概率
+              'value': float,           # V(s) 状态价值
+            }
         """
-        # 处理单样本输入
         single = (state_seq.dim() == 2)
         if single:
             state_seq = state_seq.unsqueeze(0)
 
         with torch.no_grad():
-            # Q1 选 Goal
-            goal_q, raw_input = self.q1(state_seq)
+            # Q1: 行为决策
+            logits, raw_input = self.q1(state_seq)
 
-            if epsilon > 0 and torch.rand(1).item() < epsilon:
-                goal_idx = torch.randint(0, self.num_goals, (state_seq.size(0),),
-                                         device=state_seq.device)
+            if deterministic:
+                goal = logits.argmax(dim=-1)
+                log_prob_goal = torch.zeros(goal.shape, device=goal.device)
             else:
-                goal_idx = goal_q.argmax(dim=-1)
+                dist_goal = Categorical(logits=logits)
+                goal = dist_goal.sample()
+                log_prob_goal = dist_goal.log_prob(goal)
 
-            goal_onehot = F.one_hot(goal_idx, self.num_goals).float()
+            # Goal → one_hot
+            goal_onehot = F.one_hot(goal, self.num_goals).float()
 
-            # Q2 选 Offset
-            offset_q = self.q2(raw_input, goal_onehot)
+            # Q2: 轨迹偏移 (连续高斯)
+            offset_dist = self.q2.get_dist(raw_input, goal_onehot)
 
-            if epsilon > 0 and torch.rand(1).item() < epsilon:
-                offset_idx = torch.randint(0, self.num_offsets, (state_seq.size(0),),
-                                           device=state_seq.device)
+            if deterministic:
+                p_off = offset_dist.mean
+                log_prob_offset = torch.zeros(p_off.shape, device=p_off.device)
             else:
-                offset_idx = offset_q.argmax(dim=-1)
+                p_off = offset_dist.sample()
+                log_prob_offset = offset_dist.log_prob(p_off)
+
+            # Critic: 状态价值
+            value = self.critic(state_seq)
 
         if single:
-            return goal_idx.item(), offset_idx.item()
-        return goal_idx, offset_idx
+            return {
+                'goal': goal.item(),
+                'offset': p_off.item(),
+                'log_prob_goal': log_prob_goal.item(),
+                'log_prob_offset': log_prob_offset.item(),
+                'value': value.item(),
+            }
+        return {
+            'goal': goal,
+            'offset': p_off,
+            'log_prob_goal': log_prob_goal,
+            'log_prob_offset': log_prob_offset,
+            'value': value,
+        }
 
     # ------------------------------------------------------------------
-    # 训练辅助
+    # PPO 更新用
     # ------------------------------------------------------------------
 
-    def compute_q_values(self, state_seq: torch.Tensor,
-                         goal_actions: torch.Tensor,
-                         offset_actions: torch.Tensor,
-                         use_target: bool = False) -> tuple:
-        """计算指定动作对应的 Q 值 (用于 DQN loss 计算)。
+    def evaluate_actions(self, state_seq: torch.Tensor,
+                         goals: torch.Tensor,
+                         offsets: torch.Tensor) -> dict:
+        """评估已有动作的 log_prob、entropy 和 value (PPO 更新用)。
 
         Args:
-            state_seq:      (batch, seq_len, state_dim)。
-            goal_actions:   (batch,) 选择的 Goal 索引。
-            offset_actions: (batch,) 选择的 Offset 索引。
-            use_target:     是否使用 Target Network。
+            state_seq: (batch, seq_len, state_dim)
+            goals:     (batch,) LongTensor, 离散 goal 索引
+            offsets:   (batch,) FloatTensor, 连续偏移值
 
         Returns:
-            (goal_q_selected, offset_q_selected):
-                各为 (batch,) 对应动作的 Q 值。
+            dict: {
+              'log_prob_goal', 'log_prob_offset': (batch,),
+              'entropy_goal', 'entropy_offset':   (batch,),
+              'value':                            (batch,),
+            }
         """
-        result = self.forward(state_seq, use_target=use_target)
+        # Q1: 评估 goal 动作
+        log_prob_goal, entropy_goal, raw_input = self.q1.evaluate_actions(
+            state_seq, goals)
 
-        # gather: 从 Q 值中取出对应动作的值
-        goal_q_selected = result['goal_q'].gather(
-            1, goal_actions.unsqueeze(1)
-        ).squeeze(1)  # (batch,)
+        # Goal → one_hot (使用存储的 goals，不重新采样)
+        goal_onehot = F.one_hot(goals, self.num_goals).float()
 
-        offset_q_selected = result['offset_q'].gather(
-            1, offset_actions.unsqueeze(1)
-        ).squeeze(1)  # (batch,)
+        # Q2: 评估 offset 动作
+        log_prob_offset, entropy_offset = self.q2.evaluate_actions(
+            raw_input, goal_onehot, offsets)
 
-        return goal_q_selected, offset_q_selected
+        # Critic
+        value = self.critic(state_seq)
 
-    def update_target(self, tau: float = 1.0) -> None:
-        """更新 Target Network 参数。
+        return {
+            'log_prob_goal': log_prob_goal,
+            'log_prob_offset': log_prob_offset,
+            'entropy_goal': entropy_goal,
+            'entropy_offset': entropy_offset,
+            'value': value,
+        }
+
+    def get_value(self, state_seq: torch.Tensor) -> float:
+        """仅获取状态价值 V(s) (用于 GAE 计算最后一步)。
 
         Args:
-            tau: 软更新系数。
-                 tau=1.0 → 硬拷贝 (标准 DQN)。
-                 tau<1.0 → 软更新 θ_target = τ·θ_online + (1-τ)·θ_target。
-        """
-        for param, target_param in zip(self.q1.parameters(),
-                                       self.q1_target.parameters()):
-            target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
+            state_seq: (seq_len, state_dim) 或 (batch, seq_len, state_dim)。
 
-        for param, target_param in zip(self.q2.parameters(),
-                                       self.q2_target.parameters()):
-            target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
+        Returns:
+            float (单样本) 或 Tensor (批量)。
+        """
+        single = (state_seq.dim() == 2)
+        if single:
+            state_seq = state_seq.unsqueeze(0)
+        with torch.no_grad():
+            value = self.critic(state_seq)
+        if single:
+            return value.item()
+        return value
+
+    # ------------------------------------------------------------------
+    # 可视化 / 调试
+    # ------------------------------------------------------------------
+
+    def get_probs(self, state_seq: torch.Tensor,
+                  temperature: float = 1.0) -> tuple:
+        """获取 Goal 的 Softmax 概率和 Offset 的高斯参数 (用于可视化)。
+
+        Returns:
+            (goal_probs, offset_mean, offset_std)
+        """
+        with torch.no_grad():
+            logits, raw_input = self.q1(state_seq)
+            goal_probs = F.softmax(logits / temperature, dim=-1)
+
+            goal_idx = logits.argmax(dim=-1)
+            goal_onehot = F.one_hot(goal_idx, self.num_goals).float()
+
+            offset_mean = self.q2(raw_input, goal_onehot)
+            offset_std = self.q2.log_std.exp().expand_as(offset_mean)
+
+        return goal_probs, offset_mean, offset_std
 
     # ------------------------------------------------------------------
     # 导出
     # ------------------------------------------------------------------
 
-    def get_probs(self, state_seq: torch.Tensor,
-                  temperature: float = 1.0) -> tuple:
-        """获取双层 Softmax 概率 (用于可视化和部署)。
-
-        Returns:
-            (goal_probs, offset_probs): 各 (batch, 3)。
-        """
-        with torch.no_grad():
-            goal_q, raw_input = self.q1(state_seq)
-            goal_probs = F.softmax(goal_q / temperature, dim=-1)
-
-            goal_idx = goal_q.argmax(dim=-1)
-            goal_onehot = F.one_hot(goal_idx, self.num_goals).float()
-
-            offset_q = self.q2(raw_input, goal_onehot)
-            offset_probs = F.softmax(offset_q / temperature, dim=-1)
-
-        return goal_probs, offset_probs
-
     def export_onnx(self, filepath: str = "hierarchical_policy.onnx") -> None:
-        """导出为 ONNX 格式，供 C++/ROS2 部署。
+        """导出为 ONNX 格式 (确定性推理: argmax goal + mean offset)。"""
 
-        注意: ONNX 需要一个单一的 forward 方法。
-        这里用一个 wrapper 将双层逻辑封装为单次调用。
-        """
         class OnnxWrapper(nn.Module):
             def __init__(self, policy):
                 super().__init__()
@@ -243,12 +240,11 @@ class HierarchicalPolicy(nn.Module):
                 self.num_goals = policy.num_goals
 
             def forward(self, state_seq):
-                goal_q, raw_input = self.q1(state_seq)
-                goal_idx = goal_q.argmax(dim=-1)
+                logits, raw_input = self.q1(state_seq)
+                goal_idx = logits.argmax(dim=-1)
                 goal_onehot = F.one_hot(goal_idx, self.num_goals).float()
-                offset_q = self.q2(raw_input, goal_onehot)
-                offset_idx = offset_q.argmax(dim=-1)
-                return goal_idx, offset_idx
+                offset_mean = self.q2(raw_input, goal_onehot)
+                return goal_idx, offset_mean
 
         wrapper = OnnxWrapper(self)
         wrapper.eval()
@@ -271,11 +267,12 @@ class HierarchicalPolicy(nn.Module):
         """统计各子网络参数量。"""
         q1_params = sum(p.numel() for p in self.q1.parameters())
         q2_params = sum(p.numel() for p in self.q2.parameters())
+        critic_params = sum(p.numel() for p in self.critic.parameters())
         return {
-            'q1': q1_params,
-            'q2': q2_params,
-            'total_online': q1_params + q2_params,
-            'total_with_target': 2 * (q1_params + q2_params),
+            'q1_actor': q1_params,
+            'q2_actor': q2_params,
+            'critic': critic_params,
+            'total': q1_params + q2_params + critic_params,
         }
 
 
@@ -284,62 +281,62 @@ class HierarchicalPolicy(nn.Module):
 # ======================================================================
 if __name__ == "__main__":
     print("=" * 60)
-    print("HierarchicalPolicy Self-Test")
+    print("HierarchicalPolicy Self-Test (PPO Actor-Critic)")
     print("=" * 60)
 
     policy = HierarchicalPolicy(
         state_dim=18, seq_len=3, hidden_dim=64,
-        num_goals=3, num_offsets=3,
+        num_goals=3, log_std_init=0.0,
     )
     params = policy.count_parameters()
-    print(f"Q1 params:  {params['q1']:,}")
-    print(f"Q2 params:  {params['q2']:,}")
-    print(f"Total (online):      {params['total_online']:,}")
-    print(f"Total (with target): {params['total_with_target']:,}")
+    print(f"Q1 Actor params:  {params['q1_actor']:,}")
+    print(f"Q2 Actor params:  {params['q2_actor']:,}")
+    print(f"Critic params:    {params['critic']:,}")
+    print(f"Total:            {params['total']:,}")
 
-    # --- 测试 1: 完整前向 ---
-    print("\n--- Test 1: Full forward ---")
+    # --- 测试 1: 采样动作 ---
+    print("\n--- Test 1: Select action (stochastic) ---")
     x = torch.randn(1, 3, 18)
-    result = policy.forward(x)
-    print(f"  Input:       {x.shape}")
-    print(f"  Goal Q:      {result['goal_q'].shape}      values={result['goal_q'].detach().tolist()}")
-    print(f"  Offset Q:    {result['offset_q'].shape}    values={result['offset_q'].detach().tolist()}")
-    print(f"  Goal idx:    {result['goal_idx'].tolist()}")
-    print(f"  Offset idx:  {result['offset_idx'].tolist()}")
+    result = policy.select_action(x.squeeze(0))
+    print(f"  Single sample: goal={result['goal']}, offset={result['offset']:.4f}")
+    print(f"    log_prob_goal={result['log_prob_goal']:.4f}, "
+          f"log_prob_offset={result['log_prob_offset']:.4f}")
+    print(f"    value={result['value']:.4f}")
 
-    # --- 测试 2: 动作选择 ---
-    print("\n--- Test 2: Action selection ---")
-    goal, offset = policy.select_action(x.squeeze(0), epsilon=0.0)
-    print(f"  Single sample: goal={goal}, offset={offset}")
+    # --- 测试 2: 确定性动作 ---
+    print("\n--- Test 2: Select action (deterministic) ---")
+    result_det = policy.select_action(x.squeeze(0), deterministic=True)
+    print(f"  Deterministic: goal={result_det['goal']}, offset={result_det['offset']:.4f}")
 
-    goals, offsets = policy.select_action(torch.randn(8, 3, 18), epsilon=0.3)
-    print(f"  Batch (8): goals={goals.tolist()}, offsets={offsets.tolist()}")
+    # --- 测试 3: 批量采样 ---
+    print("\n--- Test 3: Batch select action ---")
+    xb = torch.randn(8, 3, 18)
+    result_batch = policy.select_action(xb)
+    print(f"  Batch goals:   {result_batch['goal'].tolist()}")
+    print(f"  Batch offsets: {[f'{v:.3f}' for v in result_batch['offset'].tolist()]}")
 
-    # --- 测试 3: Q 值计算 (DQN loss 用) ---
-    print("\n--- Test 3: Q-value for specific actions ---")
+    # --- 测试 4: evaluate_actions (PPO 更新核心) ---
+    print("\n--- Test 4: Evaluate actions ---")
     batch = torch.randn(4, 3, 18)
-    g_act = torch.tensor([0, 1, 2, 1])
-    o_act = torch.tensor([1, 0, 2, 1])
-    gq, oq = policy.compute_q_values(batch, g_act, o_act)
-    print(f"  Goal Q selected:   {gq.detach().tolist()}")
-    print(f"  Offset Q selected: {oq.detach().tolist()}")
+    goals = torch.tensor([0, 1, 2, 1])
+    offsets = torch.tensor([0.5, -0.3, 1.2, 0.0])
+    eval_result = policy.evaluate_actions(batch, goals, offsets)
+    print(f"  log_prob_goal:   {eval_result['log_prob_goal'].detach().tolist()}")
+    print(f"  log_prob_offset: {eval_result['log_prob_offset'].detach().tolist()}")
+    print(f"  entropy_goal:    {eval_result['entropy_goal'].detach().tolist()}")
+    print(f"  entropy_offset:  {eval_result['entropy_offset'].detach().tolist()}")
+    print(f"  value:           {eval_result['value'].detach().tolist()}")
 
-    # --- 测试 4: Target network ---
-    print("\n--- Test 4: Target network update ---")
-    result_online = policy.forward(x, use_target=False)
-    result_target = policy.forward(x, use_target=True)
-    print(f"  Online goal Q:  {result_online['goal_q'].detach().tolist()}")
-    print(f"  Target goal Q:  {result_target['goal_q'].detach().tolist()}")
-    print(f"  Same? {torch.allclose(result_online['goal_q'], result_target['goal_q'])}")
+    # --- 测试 5: get_value ---
+    print("\n--- Test 5: Get value ---")
+    v = policy.get_value(x.squeeze(0))
+    print(f"  V(s) = {v:.4f}")
 
-    policy.update_target(tau=0.5)
-    result_target2 = policy.forward(x, use_target=True)
-    print(f"  After soft update (τ=0.5): {result_target2['goal_q'].detach().tolist()}")
+    # --- 测试 6: Softmax 概率 + 高斯参数 ---
+    print("\n--- Test 6: Probability output ---")
+    gp, om, os_ = policy.get_probs(x)
+    print(f"  Goal probs:    {gp.tolist()}")
+    print(f"  Offset mean:   {om.tolist()}")
+    print(f"  Offset std:    {os_.tolist()}")
 
-    # --- 测试 5: Softmax 概率 ---
-    print("\n--- Test 5: Probability output ---")
-    gp, op = policy.get_probs(x)
-    print(f"  Goal probs:   {gp.tolist()}  sum={gp.sum().item():.4f}")
-    print(f"  Offset probs: {op.tolist()}  sum={op.sum().item():.4f}")
-
-    print("\n✓ All tests passed!")
+    print("\n✓ All HierarchicalPolicy (PPO) tests passed!")

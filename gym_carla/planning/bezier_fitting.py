@@ -10,9 +10,9 @@ bezier_fitting.py — 在 Frenet 坐标系下进行 5 阶贝塞尔曲线轨迹�
   3. 采样后通过 FrenetTransform 转回笛卡尔坐标
 
 与上层 RL 的接口:
-  - Q1 输出 Goal ∈ {0: 左换道, 1: 保持, 2: 右换道}
-  - Q2 输出 Offset ∈ {0: 偏左Δd, 1: 不偏, 2: 偏右-Δd}
-  - 本模块根据 (Goal, Offset) 确定 Frenet 终点 d_f，生成轨迹
+  - Q1 输出 Goal ∈ {0: 左换道, 1: 保持, 2: 右换道} — 离散 (Eq.1)
+  - Q2 输出 p_off ∈ ℝ — 连续偏移值 (meters) (Eq.2)
+  - 本模块根据 (Goal, p_off) 确定 Frenet 终点 d_f，生成轨迹
 """
 
 import numpy as np
@@ -33,7 +33,6 @@ class BezierFitting:
         frenet: FrenetTransform 实例，用于坐标转换。
         lane_width: 车道宽度 (m)，用于计算换道目标 d。
         plan_horizon: 规划距离 (m)，即 sf - s0。
-        offset_magnitude: Q2 偏移量的绝对值 (m)。
         n_samples: 轨迹采样点数。
     """
 
@@ -42,7 +41,6 @@ class BezierFitting:
         frenet: FrenetTransform,
         lane_width: float = 3.5,
         plan_horizon: float = 30.0,
-        offset_magnitude: float = 0.5,
         n_samples: int = 50,
     ):
         """
@@ -50,13 +48,11 @@ class BezierFitting:
             frenet:            FrenetTransform 实例 (参考线已构建)。
             lane_width:        标准车道宽度 (m)，CARLA 默认约 3.5m。
             plan_horizon:      纵向规划距离 (m)，即 Δs = sf - s0。
-            offset_magnitude:  Q2 微调偏移量绝对值 (m)。
             n_samples:         沿轨迹的采样点数。
         """
         self.frenet = frenet
         self.lane_width = lane_width
         self.plan_horizon = plan_horizon
-        self.offset_magnitude = offset_magnitude
         self.n_samples = n_samples
 
     # ------------------------------------------------------------------
@@ -82,8 +78,8 @@ class BezierFitting:
         Args:
             ego_x, ego_y: 自车当前笛卡尔坐标 (m)。
             ego_yaw:      自车当前航向角 (rad)。
-            goal:         Q1 输出。0=左换道, 1=保持, 2=右换道。
-            offset:       Q2 输出。0=偏左, 1=不偏, 2=偏右。
+            goal:         Q1 输出 (int)。0=左换道, 1=保持, 2=右换道。
+            offset:       Q2 输出 (float)。连续偏移值 p_off (meters)。
 
         Returns:
             np.ndarray: 形状 (n_samples, 2) 的轨迹点 [[x, y], ...]。
@@ -115,23 +111,21 @@ class BezierFitting:
     # 轨迹终点 d 的计算
     # ------------------------------------------------------------------
 
-    def _compute_target_d(self, d0: float, goal: int, offset: int) -> float:
-        """根据 Q1(Goal) 和 Q2(Offset) 计算 Frenet 系终点横向偏移 df。
+    def _compute_target_d(self, d0: float, goal: int, offset: float) -> float:
+        """根据 Q1(Goal) 和 Q2(p_off) 计算 Frenet 系终点横向偏移 df。
 
-        目标 d 的计算:
+        目标 d 的计算 (论文 §2.1.3):
           Goal = 0 (左换道): d_goal = d0 + lane_width   (向左偏一个车道)
           Goal = 1 (保持):   d_goal = 0                 (回到车道中心)
           Goal = 2 (右换道): d_goal = d0 - lane_width   (向右偏一个车道)
 
-        Offset 微调:
-          Offset = 0 (偏左):  d_goal += offset_magnitude
-          Offset = 1 (不偏):  d_goal += 0
-          Offset = 2 (偏右):  d_goal -= offset_magnitude
+        连续偏移 (论文 Eq.2):
+          d_goal += p_off  (连续实数，正值向左，负值向右)
 
         Args:
             d0:     当前横向偏移 (m)。
             goal:   Q1 输出 {0, 1, 2}。
-            offset: Q2 输出 {0, 1, 2}。
+            offset: Q2 输出 p_off (float, meters)。连续偏移值。
 
         Returns:
             df: 目标横向偏移 (m)。
@@ -144,12 +138,8 @@ class BezierFitting:
         else:  # goal == 1, 保持车道
             d_goal = 0.0  # 回到当前车道中心
 
-        # 轨迹层 Offset → 微调
-        if offset == 0:  # 偏左
-            d_goal += self.offset_magnitude
-        elif offset == 2:  # 偏右
-            d_goal -= self.offset_magnitude
-        # offset == 1: 不偏
+        # 轨迹层: 连续偏移 p_off (论文 Eq.2)
+        d_goal += float(offset)
 
         return d_goal
 
@@ -297,7 +287,6 @@ if __name__ == "__main__":
         frenet=ft,
         lane_width=3.5,
         plan_horizon=30.0,
-        offset_magnitude=0.5,
         n_samples=50,
     )
 
@@ -305,12 +294,12 @@ if __name__ == "__main__":
     ego_x, ego_y, ego_yaw = 10.0, 0.0, 0.0
 
     print("=" * 60)
-    print("Test: Bezier trajectory generation")
+    print("Test: Bezier trajectory generation (continuous offset)")
     print("=" * 60)
 
     for goal_name, goal in [("左换道", 0), ("保持", 1), ("右换道", 2)]:
-        traj = planner.generate_trajectory(ego_x, ego_y, ego_yaw, goal=goal, offset=1)
-        s_arr, d_arr = planner.generate_trajectory_frenet(ego_x, ego_y, ego_yaw, goal=goal, offset=1)
+        traj = planner.generate_trajectory(ego_x, ego_y, ego_yaw, goal=goal, offset=0.0)
+        s_arr, d_arr = planner.generate_trajectory_frenet(ego_x, ego_y, ego_yaw, goal=goal, offset=0.0)
         curv = planner.get_trajectory_curvature(traj)
 
         print(f"\n--- Goal: {goal_name} (offset=不偏) ---")
@@ -321,10 +310,10 @@ if __name__ == "__main__":
         print(f"  最大曲率:       {curv.max():.6f}")
         print(f"  轨迹点数:       {len(traj)}")
 
-    # 测试 offset 效果
+    # 测试 连续 offset 效果
     print("\n" + "=" * 60)
-    print("Test: Offset effect on lane-keeping")
+    print("Test: Continuous offset effect on lane-keeping")
     print("=" * 60)
-    for off_name, off in [("偏左", 0), ("不偏", 1), ("偏右", 2)]:
-        traj = planner.generate_trajectory(ego_x, ego_y, ego_yaw, goal=1, offset=off)
-        print(f"  保持+{off_name}: 终点 y={traj[-1, 1]:.3f} m")
+    for off_val in [-1.0, -0.5, 0.0, 0.5, 1.0]:
+        traj = planner.generate_trajectory(ego_x, ego_y, ego_yaw, goal=1, offset=off_val)
+        print(f"  保持+offset={off_val:+.1f}m: 终点 y={traj[-1, 1]:.3f} m")
