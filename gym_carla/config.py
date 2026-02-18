@@ -34,15 +34,15 @@ DEFAULT_REL_DIST = 100.0     # 区域内无车时的默认相对距离 (m)
 # Planning (论文 §2.2.2)
 # ==============================================================
 PLAN_HORIZON = 30.0          # 贝塞尔曲线纵向规划距离 (m)
-OFFSET_RANGE = 2.0           # Q2 连续偏移最大范围 (m), |p_off| ≤ OFFSET_RANGE
-BEZIER_SAMPLES = 50          # 轨迹采样点数
+OFFSET_RANGE = 1.8           # Q2 连续偏移最大范围 (m), |p_off| ≤ OFFSET_RANGE
+BEZIER_SAMPLES = 75          # 轨迹采样点数
 
 # ==============================================================
 # Control (PID / Pure Pursuit — 训练阶段替代 DMPC)
 # ==============================================================
 WHEELBASE = 2.85             # Lincoln MKZ 轴距 (m)
 DESIRED_SPEED = 8.0          # 巡航目标速度 (m/s)
-LOOKAHEAD_DIST = 5.0         # Pure Pursuit 基础前视距离 (m)
+LOOKAHEAD_DIST = 6.0         # Pure Pursuit 基础前视距离 (m)
 CONTROL_DT = 0.1             # 控制周期 (s), 与 CARLA 同步步长一致
 
 # ==============================================================

@@ -80,11 +80,16 @@ class Q1Decision(nn.Module):
     # ------------------------------------------------------------------
 
     def get_dist(self, state_seq: torch.Tensor):
-        """获取 Goal 的 Categorical 分布。
+        """获取 Goal 的 Categorical 分布，即离散动作空间的标准分布
 
         Returns:
             dist:      Categorical 分布对象。
             raw_input: 原始输入透传 (Skip Connection)。
+            
+        使用案例
+        dist.sample()        # 采样一个动作（按概率）
+        dist.log_prob(a)     # 计算动作a的对数概率
+        dist.entropy()       # 计算熵（探索程度）
         """
         logits, raw_input = self.forward(state_seq)
         dist = Categorical(logits=logits)

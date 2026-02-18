@@ -12,11 +12,11 @@ q2_decision.py — Q² 下层轨迹偏移决策模型 (Gaussian Actor — 连续
     p_off 表示轨迹的横向偏移量 (meters)，不是离散档位。
 
   架构:
-    Input = Concat(Original_State_flat, Goal_onehot)
-          = Concat((batch, 54), (batch, 3))
-          = (batch, 57)
-    → unsqueeze → (batch, 1, 57)
-    → LSTM(input_size=57, hidden_size=64)
+    Input = Concat(Original_State_seq, Goal_onehot_expanded)
+          = Concat((batch, 3, 18), (batch, 3, 3))
+          = (batch, 3, 21)
+    → LSTM(input_size=21, hidden_size=64) 处理 3 个时间步
+    → 取最后时间步 → (batch, 64)
     → FC(64→32) → ReLU → FC(32→1) → mean μ
     → 高斯策略: p_off ~ N(μ, σ²)，σ 为可学习参数
 """
@@ -30,13 +30,15 @@ from torch.distributions import Normal
 class Q2Decision(nn.Module):
     """Q² 下层轨迹偏移决策网络 — 连续高斯策略。
 
-    ★ 关键修正 ★
+    修正
       1. Skip Connection: Q2 直接接收原始环境观测 (非 Q1 隐状态)
       2. 连续输出: 输出高斯分布 N(μ, σ²) 而非离散 Q 值
+      3. 时序建模: 保持 (batch, 3, 21) 的时序结构，充分利用 LSTM
 
     Architecture:
-        Concat(state_flat(54), goal_onehot(3)) = 57
-        → LSTM(57, 64) single step
+        Concat(state_seq(3,18), goal_expanded(3,3)) = (3, 21)
+        → LSTM(21, 64) 处理 3 个时间步
+        → 取最后时间步 → (batch, 64)
         → FC(64→32) → ReLU → FC(32→1) → μ
         + learnable log_std → σ = exp(log_std)
         → p_off ~ N(μ, σ²)
@@ -59,13 +61,12 @@ class Q2Decision(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_goals = num_goals
 
-        # Skip Connection 后的拼接维度
-        # state_flat = state_dim × seq_len = 18 × 3 = 54
-        # goal_onehot = num_goals = 3
-        # total = 54 + 3 = 57
-        self.concat_dim = state_dim * seq_len + num_goals
+        # Skip Connection 后的拼接维度（每个时间步）
+        # 每个时间步: state_dim + goal_onehot = 18 + 3 = 21
+        # 序列长度: seq_len = 3
+        self.concat_dim = state_dim + num_goals
 
-        # LSTM: 单步输入，融合 "原始状态 + 行为意图"
+        # LSTM: 多步时序输入，融合 "原始状态序列 + 行为意图"
         self.lstm = nn.LSTM(
             input_size=self.concat_dim,
             hidden_size=hidden_dim,
@@ -99,20 +100,22 @@ class Q2Decision(nn.Module):
         """
         batch_size = original_state_seq.size(0)
 
-        # 展平原始输入: (batch, 3, 18) → (batch, 54)
-        state_flat = original_state_seq.reshape(batch_size, -1)
+        # 扩展 goal 到每个时间步: (batch, 3) → (batch, seq_len=3, 3)
+        goal_expanded = goal_onehot.unsqueeze(1).expand(-1, self.seq_len, -1)
 
-        # 拼接: (batch, 54) + (batch, 3) → (batch, 57)
-        concat = torch.cat([state_flat, goal_onehot], dim=-1)
+        # 拼接: (batch, 3, 18) + (batch, 3, 3) → (batch, 3, 21)
+        concat = torch.cat([original_state_seq, goal_expanded], dim=-1)
 
-        # 升维为单步 LSTM 输入: (batch, 57) → (batch, 1, 57)
-        lstm_input = concat.unsqueeze(1)
-
-        # LSTM 处理
-        lstm_out, (h_n, c_n) = self.lstm(lstm_input)
+        # LSTM 处理 lstm_out, (h_n, c_n) = self.lstm(concat)
+        # 这个地方给维度问题说清楚
+        # 输入state_seq.shape = (4, 3, 18)， batch seq feature
+        # lstm_out.shape = (4, 3, 64)，batch seq hidden
+        # h_n.shape = (1, 4, 64)，layers batch hidden
+        # c_n.shape = (1, 4, 64)，layers batch hidden
 
         # 取输出: (batch, 1, 64) → (batch, 64)
-        last_hidden = lstm_out.squeeze(1)
+        # 三种方式等价last_hidden = h_n.squeeze(0),last_hidden = lstm_out[:, -1, :],last_hidden = lstm_out.squeeze(1)
+        last_hidden = h_n.squeeze(0)
 
         # FC 映射到均值 μ: (batch, 64) → (batch, 1) → (batch,)
         mean = self.fc_mean(last_hidden).squeeze(-1)
@@ -178,7 +181,7 @@ if __name__ == "__main__":
     model = Q2Decision(state_dim=18, seq_len=3, hidden_dim=64,
                        num_goals=3, log_std_init=0.0)
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
-    print(f"Concat dim: {model.concat_dim} (expect 57 = 18×3 + 3)")
+    print(f"Concat dim: {model.concat_dim} (expect 21 = 18 + 3)")
     print(f"Initial σ:  {model.log_std.exp().item():.4f} (expect 1.0)")
 
     # 模拟 Q1 的输出

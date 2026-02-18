@@ -38,10 +38,10 @@ class BezierFitting:
 
     def __init__(
         self,
-        frenet: FrenetTransform,
-        lane_width: float = 3.5,
-        plan_horizon: float = 30.0,
-        n_samples: int = 50,
+        frenet: FrenetTransform,      # Frenet坐标转换器（已构建好参考线）
+        lane_width: float = 3.5,      # 车道宽度（CARLA默认3.5米）
+        plan_horizon: float = 30.0,   # 规划距离（向前看30米）
+        n_samples: int = 50,          # 轨迹采样点数（50个点）
     ):
         """
         Args:
@@ -175,7 +175,7 @@ class BezierFitting:
         Returns:
             (s_arr, d_arr): 各 n_samples 个点的纵向弧长和横向偏移。
         """
-        # 贝塞尔参数 t ∈ [0, 1]
+        # 贝塞尔参数 t ∈ [0, 1] t = [0.00, 0.02, 0.04, ..., 0.98, 1.00] 50个点
         t = np.linspace(0.0, 1.0, self.n_samples)
 
         # 6 个控制点的 d 值 (根据边界条件推导)

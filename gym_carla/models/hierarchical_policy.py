@@ -79,6 +79,9 @@ class HierarchicalPolicy(nn.Module):
     def select_action(self, state_seq: torch.Tensor,
                       deterministic: bool = False) -> dict:
         """采样分层动作。
+        deterministic: bool
+        # False: 随机采样（训练时，探索）
+        # True:  确定性选择（测试/部署时，利用）
 
         Args:
             state_seq: (seq_len, state_dim) 单样本 或 (batch, seq_len, state_dim)。
