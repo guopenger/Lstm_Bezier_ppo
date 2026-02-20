@@ -516,10 +516,10 @@ def train(resume_path=None):
         losses = trainer.update(last_value)
 
         # --- Phase 4: 学习率曲线线性衰减 ---
-        #frac = 1.0 - iteration / num_iterations
-        #lr_now = cfg.LEARNING_RATE * frac
-        #for pg in trainer.optimizer.param_groups:
-        #    pg['lr'] = lr_now
+        frac = 1.0 - iteration / num_iterations
+        lr_now = cfg.LEARNING_RATE * frac
+        for pg in trainer.optimizer.param_groups:
+            pg['lr'] = lr_now
 
         iter_time = time.time() - iter_start
         avg_reward = np.mean(episode_rewards) if len(episode_rewards) > 0 else 0.0
@@ -535,7 +535,7 @@ def train(resume_path=None):
             writer.add_scalar('train/episodes', episode_num, iteration)
             writer.add_scalar('train/q2_log_std', policy.q2.log_std.item(), iteration)
             writer.add_scalar('train/q2_std', policy.q2.log_std.exp().item(), iteration)
-            # writer.add_scalar('train/learning_rate', lr_now, iteration)  # 学习率曲线
+            writer.add_scalar('train/learning_rate', lr_now, iteration)  # 学习率曲线
 
         # --- Console logging ---
         if iteration % 5 == 0 or iteration == num_iterations - 1:

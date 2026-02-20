@@ -74,7 +74,7 @@ REWARD_WEIGHT_M = 0.5       # Eq.(3) 中的 m，平衡内在和外在奖励
 # ==============================================================
 CARLA_HOST = 'localhost'
 CARLA_PORT = 2000
-CARLA_TOWN = 'Town03'
+CARLA_TOWN = 'Town04'
 CARLA_DT = 0.1
-NUMBER_OF_VEHICLES = 20
+NUMBER_OF_VEHICLES = 50
 NUMBER_OF_WALKERS = 0
