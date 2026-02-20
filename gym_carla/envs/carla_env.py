@@ -699,6 +699,10 @@ class CarlaEnv(gym.Env):
     # 更新状态
     self.last_lane_speed = new_last_lane_speed
 
+    # 换道成本（鼓励保持车道）
+    if goal != 1:  # 换道动作
+        reward -= 1.0  # 固定成本
+
     # 横向跟踪误差惩罚,跟踪黄色曲线的能力 (Q2 的核心学习信号)
     if self._last_tracking_error is not None:
         lat_err = self._last_tracking_error['lateral_error']
@@ -711,10 +715,11 @@ class CarlaEnv(gym.Env):
 
     # 接近障碍物惩罚(连续信号, 碰撞前就开始惩罚)
     front_state = self.zone_detector.detect(self.world, self.ego, self.carla_map)
-    front_dist = front_state[15]   # index 15 = Δd of Zone 6 (CF, 正前方)
-    safe_dist = 10.0               # 安全距离 10m
-    if front_dist < safe_dist:
-        reward -= 0.5 * (safe_dist - front_dist) / safe_dist
+    cf_dist = front_state[15]   # index 15 = Δd of Zone 6 (CF, 正前方)
+    if cf_dist < 15.0:
+        reward -= 1.0 * (15.0 - cf_dist) / 15.0   # 0 ~ 1.0
+    if cf_dist < 5.0:
+        reward -= 3.0   # 极度危险额外惩罚
 
     return reward
 

@@ -52,13 +52,13 @@ LEARNING_RATE = 3e-4         # 学习率
 GAMMA = 0.99                 # 折扣因子
 GAE_LAMBDA = 0.95            # GAE λ (Generalized Advantage Estimation)
 PPO_CLIP_EPSILON = 0.2       # PPO clip ratio ε
-PPO_EPOCHS = 6               # 每次 rollout 后的 PPO 更新轮数
+PPO_EPOCHS = 10              # 每次 rollout 后的 PPO 更新轮数 (6→10, 提高 clip fraction)
 NUM_MINI_BATCHES = 4         # 每轮分成的 mini-batch 数量
 VALUE_COEF = 0.5             # Value loss 系数 c1
 ENTROPY_COEF = 0.005         # Entropy bonus 系数 c2
 MAX_GRAD_NORM = 0.5          # 梯度裁剪范数
 ROLLOUT_STEPS = 1024         # 每次收集的交互步数
-NUM_ITERATIONS = 1600        # PPO 迭代次数 (总步数 ≈ ROLLOUT_STEPS × NUM_ITERATIONS)
+NUM_ITERATIONS = 710         # PPO 迭代次数 (总步数 ≈ ROLLOUT_STEPS × NUM_ITERATIONS)
 MAX_STEPS_PER_EPISODE = 500  # 单 episode 最大步数
 OFFSET_LOG_STD_INIT = -0.5   # Q2 高斯策略初始 log(σ)
 

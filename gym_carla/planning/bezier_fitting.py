@@ -114,10 +114,15 @@ class BezierFitting:
     def _compute_target_d(self, d0: float, goal: int, offset: float) -> float:
         """根据 Q1(Goal) 和 Q2(p_off) 计算 Frenet 系终点横向偏移 df。
 
+        CARLA 坐标系约定:
+        - 车辆朝向 = forward vector (fw)
+        - 左侧 = fw 逆时针旋转 90°
+        - Frenet d: d < 0 = 左侧, d > 0 = 右侧
+
         目标 d 的计算 (论文 §2.1.3):
-          Goal = 0 (左换道): d_goal = d0 + lane_width   (向左偏一个车道)
+          Goal = 0 (左换道): d_goal = d0 - lane_width   (向左偏一个车道)
           Goal = 1 (保持):   d_goal = 0                 (回到车道中心)
-          Goal = 2 (右换道): d_goal = d0 - lane_width   (向右偏一个车道)
+          Goal = 2 (右换道): d_goal = d0 + lane_width   (向右偏一个车道)
 
         连续偏移 (论文 Eq.2):
           d_goal += p_off  (连续实数，正值向左，负值向右)
@@ -132,13 +137,14 @@ class BezierFitting:
         """
         # 行为层 Goal → 大方向
         if goal == 0:  # 左换道
-            d_goal = d0 + self.lane_width
-        elif goal == 2:  # 右换道
             d_goal = d0 - self.lane_width
+        elif goal == 2:  # 右换道
+            d_goal = d0 + self.lane_width
         else:  # goal == 1, 保持车道
             d_goal = 0.0  # 回到当前车道中心
 
         # 轨迹层: 连续偏移 p_off (论文 Eq.2)
+        # offset > 0 向右, offset < 0 向左，必须全链路统一！
         d_goal += float(offset)
 
         return d_goal

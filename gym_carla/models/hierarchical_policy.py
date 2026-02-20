@@ -50,7 +50,8 @@ class HierarchicalPolicy(nn.Module):
 
     def __init__(self, state_dim: int = 18, seq_len: int = 3,
                  hidden_dim: int = 64, num_goals: int = 3,
-                 log_std_init: float = 0.0):
+                 log_std_init: float = 0.0,
+                 offset_range: float = 1.8):
         """
         Args:
             state_dim:    单步状态维度 (18)。
@@ -58,11 +59,16 @@ class HierarchicalPolicy(nn.Module):
             hidden_dim:   LSTM 隐藏层维度 (64)。
             num_goals:    Q1 输出类别数 (3)。
             log_std_init: Q2 高斯策略初始 log(σ)。
+            offset_range: Q2 输出动作范围 ±offset_range (m)。
+                          select_action 中先 clamp 再算 log_prob，
+                          确保 buffer 存储的 offset 和 log_prob 对应
+                          环境实际执行的动作，避免 raw/clipped 不匹配。
         """
         super().__init__()
         self.state_dim = state_dim
         self.seq_len = seq_len
         self.num_goals = num_goals
+        self.offset_range = offset_range
 
         # Actor 网络
         self.q1 = Q1Decision(state_dim, seq_len, hidden_dim, num_goals)
@@ -120,9 +126,15 @@ class HierarchicalPolicy(nn.Module):
 
             if deterministic:
                 p_off = offset_dist.mean
+                # 确定性模式也做 clamp，保证输出在合法范围内
+                p_off = torch.clamp(p_off, -self.offset_range, self.offset_range)
                 log_prob_offset = torch.zeros(p_off.shape, device=p_off.device)
             else:
                 p_off = offset_dist.sample()
+                # ★ 关键修复: 先 clamp 到动作范围，再算 log_prob
+                # 保证 buffer 中存储的 offset 和 log_prob 对应环境实际执行的动作
+                # 避免 raw 值越界后被 clip 到 ±R，但 log_prob 却是 raw 值的
+                p_off = torch.clamp(p_off, -self.offset_range, self.offset_range)
                 log_prob_offset = offset_dist.log_prob(p_off)
 
             # Critic: 状态价值

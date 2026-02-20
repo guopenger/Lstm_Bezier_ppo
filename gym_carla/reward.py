@@ -45,7 +45,7 @@ def get_hierarchical_reward(ego, collision_hist, desired_speed, goal, last_lane_
     if is_lane_change:
         # 换道后速度是否提升（论文原文："the vehicle's speed has increased after changing lanes"）
         # 加一个小阈值 0.5 m/s 避免噪声
-        if current_speed > last_lane_speed + 0.5:
+        if current_speed > last_lane_speed + 1.5:
             p_l = 1.0
     else:
         # 保持车道时，更新基准速度
