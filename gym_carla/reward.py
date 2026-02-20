@@ -54,7 +54,7 @@ def get_hierarchical_reward(ego, collision_hist, desired_speed, goal, last_lane_
     # --- 3. 计算各项 σ ---
     
     # σ_c: 碰撞惩罚 (Eq.5)
-    sigma_c = -5.0 * p_c
+    sigma_c = -50.0 * p_c
     
     # σ_v: 速度跟踪奖励 (Eq.6)
     err_v = current_speed - v_max
@@ -121,7 +121,7 @@ def get_hierarchical_reward_with_details(ego, collision_hist, desired_speed,
     else:
         new_last_lane_speed = current_speed
     
-    sigma_c = -5.0 * p_c
+    sigma_c = -50.0 * p_c
     
     err_v = current_speed - v_max
     sigma_v = 10.0 * np.exp(-(err_v**2) / (5.0 * max(v_max, 1.0)))

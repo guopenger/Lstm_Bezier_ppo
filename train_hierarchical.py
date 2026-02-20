@@ -228,6 +228,11 @@ class HierarchicalPPOTrainer:
         # 1. 计算 GAE advantages 和 returns
         self.rollout.compute_returns_and_advantages(last_value, gamma, gae_lambda)
 
+        ret = np.array(self.rollout.returns, dtype=np.float32)
+        ret_mean = ret.mean()
+        ret_std = ret.std() + 1e-8
+        self.rollout.returns = (ret - ret_mean) / ret_std
+
         # 2. 多轮 PPO epoch 更新
         total_policy_loss = 0.0
         total_value_loss = 0.0
@@ -282,7 +287,10 @@ class HierarchicalPPOTrainer:
 
                 self.optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                # 分别裁剪 Actor 和 Critic 的梯度（避免互相干扰）
+                nn.utils.clip_grad_norm_(self.policy.q1.parameters(), self.max_grad_norm)
+                nn.utils.clip_grad_norm_(self.policy.q2.parameters(), self.max_grad_norm)
+                nn.utils.clip_grad_norm_(self.policy.critic.parameters(), self.max_grad_norm)
                 self.optimizer.step()
 
                 total_policy_loss += policy_loss.item()
@@ -310,7 +318,7 @@ def make_env_params():
     """Construct environment parameters for hierarchical mode."""
     return {
         # Display / rendering
-        'display_size': 256,
+        'display_size': 0, # 0表示不打开pygame界面，256表示打开
         'max_past_step': 1,
         'number_of_vehicles': cfg.NUMBER_OF_VEHICLES,
         'number_of_walkers': cfg.NUMBER_OF_WALKERS,
@@ -507,6 +515,12 @@ def train(resume_path=None):
         policy.train()
         losses = trainer.update(last_value)
 
+        # --- Phase 4: 学习率曲线线性衰减 ---
+        #frac = 1.0 - iteration / num_iterations
+        #lr_now = cfg.LEARNING_RATE * frac
+        #for pg in trainer.optimizer.param_groups:
+        #    pg['lr'] = lr_now
+
         iter_time = time.time() - iter_start
         avg_reward = np.mean(episode_rewards) if len(episode_rewards) > 0 else 0.0
 
@@ -521,6 +535,7 @@ def train(resume_path=None):
             writer.add_scalar('train/episodes', episode_num, iteration)
             writer.add_scalar('train/q2_log_std', policy.q2.log_std.item(), iteration)
             writer.add_scalar('train/q2_std', policy.q2.log_std.exp().item(), iteration)
+            # writer.add_scalar('train/learning_rate', lr_now, iteration)  # 学习率曲线
 
         # --- Console logging ---
         if iteration % 5 == 0 or iteration == num_iterations - 1:

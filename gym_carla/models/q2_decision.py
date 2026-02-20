@@ -106,7 +106,8 @@ class Q2Decision(nn.Module):
         # 拼接: (batch, 3, 18) + (batch, 3, 3) → (batch, 3, 21)
         concat = torch.cat([original_state_seq, goal_expanded], dim=-1)
 
-        # LSTM 处理 lstm_out, (h_n, c_n) = self.lstm(concat)
+        # LSTM 处理
+        lstm_out, (h_n, c_n) = self.lstm(concat)
         # 这个地方给维度问题说清楚
         # 输入state_seq.shape = (4, 3, 18)， batch seq feature
         # lstm_out.shape = (4, 3, 64)，batch seq hidden

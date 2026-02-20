@@ -208,8 +208,12 @@ class CarlaEnv(gym.Env):
     self.lidar_sensor = None
     self.camera_sensor = None
     
-    # Initialize the renderer
-    self._init_renderer()
+    # Initialize the renderer only if display_size > 0
+    if self.display_size > 0:
+      self._init_renderer()
+    else:
+      self.display = None
+      self.birdeye_render = None
 
     # Get pixel grid points
     if self.pixor:
@@ -333,8 +337,9 @@ class CarlaEnv(gym.Env):
     self.routeplanner = RoutePlanner(self.ego, self.max_waypt)
     self.waypoints, _, self.vehicle_front = self.routeplanner.run_step()
 
-    # Set ego information for render
-    self.birdeye_render.set_hero(self.ego, self.ego.id)
+    # Set ego information for render (only if display is enabled)
+    if self.birdeye_render is not None:
+      self.birdeye_render.set_hero(self.ego, self.ego.id)
 
     # Reset hierarchical state buffer and build reference line
     if self.hierarchical:
@@ -619,9 +624,11 @@ class CarlaEnv(gym.Env):
             f"speed={ego_speed:.1f}, throttle={throttle:.2f}, steer={steer:.3f}, "
             f"lat_err={err['lateral_error']:.2f}")
 
-    # Apply control (CARLA steer needs negation)
+    # Apply control
+    # Pure Pursuit 输出已符合 CARLA 约定 (正值=右转)，无需取反
+    # 注: 原版非分层模式的 -steer 是因为 RL 策略用「左正」约定
     act = carla.VehicleControl(
-      throttle=float(throttle), steer=float(-steer), brake=float(brake))
+      throttle=float(throttle), steer=float(steer), brake=float(brake))
     self.ego.apply_control(act)
 
     self.world.tick()
@@ -676,7 +683,7 @@ class CarlaEnv(gym.Env):
     
     Args:
         goal: Q1 action (0=left, 1=keep, 2=right)
-        offset: Q2 action (0=left, 1=center, 2=right) - 论文中未直接使用
+        offset: Q2 action
     
     Returns:
         float: reward
@@ -691,7 +698,24 @@ class CarlaEnv(gym.Env):
     
     # 更新状态
     self.last_lane_speed = new_last_lane_speed
-    
+
+    # 横向跟踪误差惩罚,跟踪黄色曲线的能力 (Q2 的核心学习信号)
+    if self._last_tracking_error is not None:
+        lat_err = self._last_tracking_error['lateral_error']
+        reward -= 0.6 * lat_err  # 线性惩罚，比二次更稳定
+
+    # 车道中心距离惩罚 
+    ego_x, ego_y = get_pos(self.ego)
+    lane_dis, _ = get_lane_dis(self.waypoints, ego_x, ego_y)
+    reward -= 0.3 * abs(lane_dis)
+
+    # 接近障碍物惩罚(连续信号, 碰撞前就开始惩罚)
+    front_state = self.zone_detector.detect(self.world, self.ego, self.carla_map)
+    front_dist = front_state[15]   # index 15 = Δd of Zone 6 (CF, 正前方)
+    safe_dist = 10.0               # 安全距离 10m
+    if front_dist < safe_dist:
+        reward -= 0.5 * (safe_dist - front_dist) / safe_dist
+
     return reward
 
   # ==================================================================
@@ -701,38 +725,47 @@ class CarlaEnv(gym.Env):
     if self.hierarchical:
       return self._get_hierarchical_obs()
 
-    ## Birdeye rendering
-    self.birdeye_render.vehicle_polygons = self.vehicle_polygons
-    self.birdeye_render.walker_polygons = self.walker_polygons
-    self.birdeye_render.waypoints = self.waypoints
+    ## Birdeye rendering (skip if display is disabled)
+    if self.birdeye_render is not None:
+      self.birdeye_render.vehicle_polygons = self.vehicle_polygons
+      self.birdeye_render.walker_polygons = self.walker_polygons
+      self.birdeye_render.waypoints = self.waypoints
 
-    # birdeye view with roadmap and actors
-    birdeye_render_types = ['roadmap', 'actors']
-    if self.display_route:
-      birdeye_render_types.append('waypoints')
-    self.birdeye_render.render(self.display, birdeye_render_types)
-    birdeye = pygame.surfarray.array3d(self.display)
-    birdeye = birdeye[0:self.display_size, :, :]
-    birdeye = display_to_rgb(birdeye, self.obs_size)
-
-    # Roadmap
-    if self.pixor:
-      roadmap_render_types = ['roadmap']
+      # birdeye view with roadmap and actors
+      birdeye_render_types = ['roadmap', 'actors']
       if self.display_route:
-        roadmap_render_types.append('waypoints')
-      self.birdeye_render.render(self.display, roadmap_render_types)
-      roadmap = pygame.surfarray.array3d(self.display)
-      roadmap = roadmap[0:self.display_size, :, :]
-      roadmap = display_to_rgb(roadmap, self.obs_size)
-      # Add ego vehicle
-      for i in range(self.obs_size):
-        for j in range(self.obs_size):
-          if abs(birdeye[i, j, 0] - 255)<20 and abs(birdeye[i, j, 1] - 0)<20 and abs(birdeye[i, j, 0] - 255)<20:
-            roadmap[i, j, :] = birdeye[i, j, :]
+        birdeye_render_types.append('waypoints')
+      self.birdeye_render.render(self.display, birdeye_render_types)
+      birdeye = pygame.surfarray.array3d(self.display)
+      birdeye = birdeye[0:self.display_size, :, :]
+      birdeye = display_to_rgb(birdeye, self.obs_size)
+    else:
+      # Create dummy birdeye image when display is disabled
+      birdeye = np.zeros((self.obs_size, self.obs_size, 3), dtype=np.uint8)
 
-    # Display birdeye image
-    birdeye_surface = rgb_to_display_surface(birdeye, self.display_size)
-    self.display.blit(birdeye_surface, (0, 0))
+    # Roadmap (skip if display is disabled)
+    if self.pixor:
+      if self.birdeye_render is not None:
+        roadmap_render_types = ['roadmap']
+        if self.display_route:
+          roadmap_render_types.append('waypoints')
+        self.birdeye_render.render(self.display, roadmap_render_types)
+        roadmap = pygame.surfarray.array3d(self.display)
+        roadmap = roadmap[0:self.display_size, :, :]
+        roadmap = display_to_rgb(roadmap, self.obs_size)
+        # Add ego vehicle
+        for i in range(self.obs_size):
+          for j in range(self.obs_size):
+            if abs(birdeye[i, j, 0] - 255)<20 and abs(birdeye[i, j, 1] - 0)<20 and abs(birdeye[i, j, 0] - 255)<20:
+              roadmap[i, j, :] = birdeye[i, j, :]
+      else:
+        # Create dummy roadmap when display is disabled
+        roadmap = np.zeros((self.obs_size, self.obs_size, 3), dtype=np.uint8)
+
+    # Display birdeye image (only if display is enabled)
+    if self.display is not None:
+      birdeye_surface = rgb_to_display_surface(birdeye, self.display_size)
+      self.display.blit(birdeye_surface, (0, 0))
 
     ## Lidar image generation
     # Get point cloud data - CARLA 0.9.13+ uses raw_data buffer format
@@ -767,22 +800,25 @@ class CarlaEnv(gym.Env):
     lidar = np.rot90(lidar, 1)
     lidar = lidar * 255
 
-    # Display lidar image
-    lidar_surface = rgb_to_display_surface(lidar, self.display_size)
-    self.display.blit(lidar_surface, (self.display_size, 0))
+    # Display lidar image (only if display is enabled)
+    if self.display is not None:
+      lidar_surface = rgb_to_display_surface(lidar, self.display_size)
+      self.display.blit(lidar_surface, (self.display_size, 0))
 
     ## Display camera image
-    camera = resize(self.camera_img, (self.obs_size, self.obs_size)) * 255
-    camera_surface = rgb_to_display_surface(camera, self.display_size)
-    self.display.blit(camera_surface, (self.display_size * 2, 0))
+    if self.display is not None:
+      camera = resize(self.camera_img, (self.obs_size, self.obs_size)) * 255
+      camera_surface = rgb_to_display_surface(camera, self.display_size)
+      self.display.blit(camera_surface, (self.display_size * 2, 0))
 
-    # Display on pygame
-    pygame.display.flip()
-    
-    # Process pygame events to prevent window from freezing
-    for event in pygame.event.get():
-      if event.type == pygame.QUIT:
-        pass
+    # Display on pygame (only if display is enabled)
+    if self.display is not None:
+      pygame.display.flip()
+      
+      # Process pygame events to prevent window from freezing
+      for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+          pass
 
     # State observation
     ego_trans = self.ego.get_transform()
@@ -871,10 +907,11 @@ class CarlaEnv(gym.Env):
       print(f"  Δv: {state_18d[2:10]}")
       print(f"  Δd: {state_18d[10:18]}")
 
-    # Process pygame events to prevent window from freezing
-    for event in pygame.event.get():
-      if event.type == pygame.QUIT:
-        pass
+    # Process pygame events to prevent window from freezing (only if pygame is initialized)
+    if self.display is not None:
+      for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+          pass
 
     return self.state_buffer.get_numpy().astype(np.float32)
 
@@ -937,8 +974,9 @@ class CarlaEnv(gym.Env):
 
     # If out of lane
     dis, _ = get_lane_dis(self.waypoints, ego_x, ego_y)
-    if abs(dis) > self.out_lane_thres:
-      return True
+    thres = 4.0 if self.hierarchical else self.out_lane_thres
+    if abs(dis) > thres:
+        return True
 
     return False
 

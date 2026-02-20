@@ -177,7 +177,8 @@ class TrajectoryTracker:
         dx = lookahead_pt[0] - ego.x
         dy = lookahead_pt[1] - ego.y
 
-        # 转到自车坐标系 (前方为 x_local, 左方为 y_local)
+        # 转到自车坐标系 (前方为 x_local, 右方为 y_local)
+        # CARLA 左手系: +Y = 右方, 正 local_y 表示目标在右侧
         local_x = dx * math.cos(ego.yaw) + dy * math.sin(ego.yaw)
         local_y = -dx * math.sin(ego.yaw) + dy * math.cos(ego.yaw)
 
