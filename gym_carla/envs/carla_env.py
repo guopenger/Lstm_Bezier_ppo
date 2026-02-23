@@ -54,6 +54,10 @@ class CarlaEnv(gym.Env):
     self.desired_speed = params['desired_speed']
     self.max_ego_spawn_times = params['max_ego_spawn_times']
     self.display_route = params['display_route']
+    self._prev_lane_id = None
+    self._lane_change_detected = False   # 是否检测到了一次有效换道
+    self._stable_counter = 0             # 在新车道上稳定行驶的步数
+    self._cached_zone_state = None       # 缓存 zone_detector 结果，避免重复调用 
     if 'pixor' in params.keys():
       self.pixor = params['pixor']
       self.pixor_size = params['pixor_size']
@@ -208,6 +212,10 @@ class CarlaEnv(gym.Env):
     self.lidar_sensor = None
     self.camera_sensor = None
     
+    # BEV 功能已完全移除
+    self.bev_producer = None
+    self.bev_img = None
+    
     # Initialize the renderer only if display_size > 0
     if self.display_size > 0:
       self._init_renderer()
@@ -227,6 +235,11 @@ class CarlaEnv(gym.Env):
       self.collision_sensor.destroy()
     self.collision_sensor = None
 
+    self._prev_lane_id = None
+    self._lane_change_detected = False
+    self._stable_counter = 0
+    self._cached_zone_state = None 
+
     if self.lidar_sensor is not None and self.lidar_sensor.is_alive:
       self.lidar_sensor.destroy()
     self.lidar_sensor = None
@@ -234,6 +247,12 @@ class CarlaEnv(gym.Env):
     if self.camera_sensor is not None and self.camera_sensor.is_alive:
       self.camera_sensor.destroy()
     self.camera_sensor = None
+
+    # 清理高空俯视相机（测试可视化用）
+    if hasattr(self, 'overhead_sensor') and self.overhead_sensor is not None:
+      if self.overhead_sensor.is_alive:
+        self.overhead_sensor.destroy()
+      self.overhead_sensor = None
 
     # Delete sensors, vehicles and walkers
     self._clear_all_actors(['sensor.other.collision', 'sensor.lidar.ray_cast', 'sensor.camera.rgb', 'vehicle.*', 'controller.ai.walker', 'walker.*'])
@@ -321,6 +340,31 @@ class CarlaEnv(gym.Env):
         self.camera_img = array
       self.camera_sensor.listen(get_camera_img)
 
+    # 高空俯视相机（仅用于测试可视化，hierarchical 模式 + display_size > 0）
+    if self.hierarchical and self.display_size > 0:
+      self.overhead_img = np.zeros((256, 256, 3), dtype=np.uint8)
+      overhead_bp = self.world.get_blueprint_library().find('sensor.camera.rgb')
+      overhead_bp.set_attribute('image_size_x', '256')
+      overhead_bp.set_attribute('image_size_y', '256')
+      overhead_bp.set_attribute('fov', '90')
+      # 后上方俯视: 后退 8m，高度 25m，俯角 70°
+      overhead_transform = carla.Transform(
+        carla.Location(x=-8.0, z=25.0),
+        carla.Rotation(pitch=-70.0)
+      )
+      self.overhead_sensor = self.world.spawn_actor(
+        overhead_bp, overhead_transform, attach_to=self.ego)
+      
+      def get_overhead_img(data):
+        array = np.frombuffer(data.raw_data, dtype=np.uint8)
+        array = np.reshape(array, (data.height, data.width, 4))
+        self.overhead_img = array[:, :, :3][:, :, ::-1].copy()
+      
+      self.overhead_sensor.listen(get_overhead_img)
+    else:
+      self.overhead_sensor = None
+      self.overhead_img = None
+
     # Update timesteps
     self.time_step=0
     self.reset_step+=1
@@ -349,7 +393,8 @@ class CarlaEnv(gym.Env):
       self._last_tracking_error = None
       # Build Frenet reference line from initial waypoints
       self._build_reference_line()
-
+      self.last_lane_speed = 0.0
+      
     return self._get_obs()
   
   def step(self, action):
@@ -579,7 +624,6 @@ class CarlaEnv(gym.Env):
     """
     goal = int(action[0])
     offset = float(action[1])  # 连续偏移值
-
     # Get ego state
     ego_trans = self.ego.get_transform()
     ego_x = ego_trans.location.x
@@ -588,14 +632,24 @@ class CarlaEnv(gym.Env):
     v = self.ego.get_velocity()
     ego_speed = np.sqrt(v.x**2 + v.y**2)
 
+    # 前 10 步强制保持车道，让 Bezier 从 ego 位置平滑回到参考线
+    if self.time_step < 10:
+        goal = 1
+        offset = 0.0
+        
+    # 提前获取前方障碍物信息
+    self._cached_zone_state = self.zone_detector.detect(self.world, self.ego, self.carla_map) 
+    cf_dist = self._cached_zone_state[15]  # Zone 6 (CF 中前) 距离 
+
     # Update reference line periodically
     if self.time_step % 10 == 0:
       self._build_reference_line()
 
     # Generate Bezier trajectory
     try:
+      use_smooth = (self.time_step < 10)
       trajectory = self.bezier.generate_trajectory(
-        ego_x, ego_y, ego_yaw, goal, offset)
+        ego_x, ego_y, ego_yaw, goal, offset, use_smooth=use_smooth)
       self._last_trajectory = trajectory
     except Exception as e:
       # Fallback: straight ahead trajectory
@@ -646,6 +700,66 @@ class CarlaEnv(gym.Env):
     # Route planner update
     self.waypoints, _, self.vehicle_front = self.routeplanner.run_step()
 
+    # === 被动全局轨迹跟随：蓝色轨迹顺应车辆换道行为 ===
+    ego_wp = self.carla_map.get_waypoint(self.ego.get_transform().location)
+    cur_lane_id = ego_wp.lane_id
+    
+    # 首次初始化
+    if self._prev_lane_id is None:
+        self._prev_lane_id = cur_lane_id
+    
+    # --- 阶段 1：检测 lane_id 变化 ---
+    if not self._lane_change_detected:
+        if cur_lane_id != self._prev_lane_id:
+            # lane_id 变了，检查两个前提条件：
+            # 条件 A：同向车道（lane_id 符号相同）
+            # 说明：cur_lane_id * prev_lane_id > 0 表示符号相同
+            #       如果任一为 0，乘积为 0，自动判定为非同向
+            same_direction = (cur_lane_id * self._prev_lane_id > 0)
+            
+            # 条件 B：前方有障碍物
+            has_obstacle = (cf_dist < 15.0)
+            
+            if same_direction and has_obstacle:
+                # 两个条件都满足，启动稳定计数
+                self._lane_change_detected = True
+                self._stable_counter = 1  # 当前步算第 1 步
+                print(f"[LaneFollow] 检测到换道: {self._prev_lane_id} → {cur_lane_id}, 开始计数")
+            elif not same_direction:
+                # 对向车道或 lane_id=0，完全忽略，不更新 _prev_lane_id
+                pass
+            else:
+                # 同向但无障碍物（弯道漂移等），忽略本次 lane_id 变化
+                self._prev_lane_id = cur_lane_id
+    
+    # --- 阶段 2：等待稳定 ---
+    elif self._lane_change_detected:
+        if cur_lane_id == self._prev_lane_id:
+            # 车辆又回到了原来的车道，取消本次重建
+            self._lane_change_detected = False
+            self._stable_counter = 0
+            print(f"[LaneFollow] 换道取消: 车辆回到原车道 {cur_lane_id}")
+        elif cur_lane_id == 0 or cur_lane_id * self._prev_lane_id < 0:
+            # lane_id=0（中心线）或对向车道（符号相反），取消并不更新
+            self._lane_change_detected = False
+            self._stable_counter = 0
+            print(f"[LaneFollow] 换道取消: 检测到异常车道 {cur_lane_id}")
+        else:
+            # 还在新车道上，继续计数
+            self._stable_counter += 1
+            
+            if self._stable_counter >= 10:
+                # ✅ 稳定 10 步，执行重建！
+                if self.routeplanner.rebuild_from_vehicle():
+                    self.waypoints, _, self.vehicle_front = self.routeplanner.run_step()
+                    self._build_reference_line()
+                    print(f"[LaneFollow] 全局轨迹已更新到 lane_id={cur_lane_id}")
+                
+                # 重置所有状态
+                self._prev_lane_id = cur_lane_id
+                self._lane_change_detected = False
+                self._stable_counter = 0
+
     # State information
     info = {
       'waypoints': self.waypoints,
@@ -688,38 +802,104 @@ class CarlaEnv(gym.Env):
     Returns:
         float: reward
     """
+    # 复用 _step_hierarchical 中缓存的 zone_detector 结果，避免重复调用 
+    front_state = (self._cached_zone_state if self._cached_zone_state is not None else self.zone_detector.detect(self.world, self.ego, self.carla_map)) 
+    cf_rel_speed = front_state[7] # Zone 6 (CF 中前) 相对速度
+    cf_dist = front_state[15]   # Zone 6 (CF 前方) 距离
+    lf_dist = front_state[14]   # Zone 5 (LF 左前) 距离
+    rf_dist = front_state[16]   # Zone 7 (RF 右前) 距离
+    ls_dist = front_state[13]   # Zone 4 (LS 左侧) 距离
+    rs_dist = front_state[17]   # Zone 8 (RS 右侧) 距离
+    
+    # 1.基础奖励
     reward, new_last_lane_speed = get_hierarchical_reward(
         ego=self.ego,
         collision_hist=self.collision_hist,
         desired_speed=self.desired_speed,
         goal=goal,
-        last_lane_speed=self.last_lane_speed
+        last_lane_speed=self.last_lane_speed,
+        cf_dist=cf_dist,
+        cf_rel_speed=cf_rel_speed
     )
-    
-    # 更新状态
     self.last_lane_speed = new_last_lane_speed
 
-    # 换道成本（鼓励保持车道）
-    if goal != 1:  # 换道动作
-        reward -= 1.0  # 固定成本
-
-    # 横向跟踪误差惩罚,跟踪黄色曲线的能力 (Q2 的核心学习信号)
+    # 2.横向跟踪误差惩罚,跟踪黄色曲线的能力 (Q2 的核心学习信号)
     if self._last_tracking_error is not None:
         lat_err = self._last_tracking_error['lateral_error']
         reward -= 0.6 * lat_err  # 线性惩罚，比二次更稳定
 
-    # 车道中心距离惩罚 
+    # 3.贝塞尔曲线偏离中心距离惩罚
     ego_x, ego_y = get_pos(self.ego)
     lane_dis, _ = get_lane_dis(self.waypoints, ego_x, ego_y)
-    reward -= 0.3 * abs(lane_dis)
+    if self._lane_change_detected:
+        reward -= 0.2 * abs(lane_dis)  # 降低到原来的 1/3
+    else:
+        reward -= 0.6 * abs(lane_dis)  # 正常惩罚
 
-    # 接近障碍物惩罚(连续信号, 碰撞前就开始惩罚)
-    front_state = self.zone_detector.detect(self.world, self.ego, self.carla_map)
-    cf_dist = front_state[15]   # index 15 = Δd of Zone 6 (CF, 正前方)
+    # 4.五面感知障碍物惩罚(连续信号, 碰撞前就开始惩罚)
+      # 前方有车
     if cf_dist < 15.0:
-        reward -= 1.0 * (15.0 - cf_dist) / 15.0   # 0 ~ 1.0
-    if cf_dist < 5.0:
-        reward -= 3.0   # 极度危险额外惩罚
+        reward -= 1.0 * (15.0 - cf_dist) / 15.0   # 0 ~ 3.0，感知范围扩大到20m
+    if cf_dist < 10.0:
+        reward -= 2.0 * (10.0 - cf_dist) / 10.0   # 再叠加 0 ~ 3.0
+    if cf_dist < 6.0:
+        reward -= 3.0 * (6.0 - cf_dist) / 6.0
+
+    # 5. 换道成本
+    if goal != 1:
+        if cf_dist > 15.0:
+            reward -= 1.0   # 没必要换道
+        else:
+            reward -= 0.1   # 鼓励避障换道
+
+    # 6.避障超出道路边界惩罚
+    abs_lane_dis = abs(lane_dis)
+    ego_wp = self.carla_map.get_waypoint(self.ego.get_transform().location)
+    half_lane = ego_wp.lane_width / 2.0 if ego_wp else 1.75
+    if self._lane_change_detected:
+        if abs_lane_dis > half_lane:
+            reward -= 0.4 * (abs_lane_dis - half_lane)
+        if abs_lane_dis > half_lane + 1.0:
+            reward -= 1.0
+    else:
+        if abs_lane_dis > half_lane:
+            reward -= 1.0 * (abs_lane_dis - half_lane)
+        if abs_lane_dis > half_lane + 1.0:
+            reward -= 3.0
+
+    # 7.换道可行性惩罚，不能往不存在/对向的车道换
+    if goal == 0:
+        left_lane = ego_wp.get_left_lane()
+        if (left_lane is None or left_lane.lane_type != carla.LaneType.Driving
+            or left_lane.lane_id * ego_wp.lane_id < 0):  # 符号不同=对向车道
+            reward -= 3.0
+    elif goal == 2:
+        right_lane = ego_wp.get_right_lane()
+        if (right_lane is None or right_lane.lane_type != carla.LaneType.Driving
+            or right_lane.lane_id * ego_wp.lane_id < 0):  # 符号不同=对向车道
+            reward -= 3.0
+    
+    # 8.动态速度调节，前方全堵时要减速等待
+    v = self.ego.get_velocity()
+    ego_speed = np.sqrt(v.x**2 + v.y**2)
+    
+    all_blocked_dist = 15.0
+    all_blocked = (cf_dist < all_blocked_dist and
+                   lf_dist < all_blocked_dist and
+                   rf_dist < all_blocked_dist)
+
+    if all_blocked:
+        min_front_dist = min(cf_dist, lf_dist, rf_dist)
+        safe_speed = max(0.0, min_front_dist / 15.0 * 4.0)
+
+        if ego_speed <= safe_speed + 1.0:
+            reward += 0.5    # 原来 2.0 → 0.5
+        else:
+            reward -= 0.3 * (ego_speed - safe_speed)  # 原来 0.5 → 0.3
+    else:
+        if ego_speed < 3.0 and cf_dist > 20.0:
+            reward -= 0.3    # 原来 0.5 → 0.3
+
 
     return reward
 
@@ -978,10 +1158,22 @@ class CarlaEnv(gym.Env):
           return True
 
     # If out of lane
-    dis, _ = get_lane_dis(self.waypoints, ego_x, ego_y)
-    thres = 4.0 if self.hierarchical else self.out_lane_thres
-    if abs(dis) > thres:
-        return True
+    if self.hierarchical:
+        # 使用 CARLA 原生 API 判断：只要在任何可行驶车道上就不算出界
+        ego_loc = self.ego.get_transform().location
+        ego_wp = self.carla_map.get_waypoint(ego_loc, project_to_road=True)
+        if ego_wp is None or ego_wp.lane_type != carla.LaneType.Driving:
+            return True
+        # 宽松的安全检查：允许车辆偏离车道中心较远（1.5倍车道宽度）
+        # 这样 3.5m 车道允许偏离 4.2m，4.5m 车道允许偏离 5.4m
+        wp_loc = ego_wp.transform.location
+        dist_to_center = ego_loc.distance(wp_loc)
+        if dist_to_center > ego_wp.lane_width * 1.5:
+            return True
+    else:
+        dis, _ = get_lane_dis(self.waypoints, ego_x, ego_y)
+        if abs(dis) > self.out_lane_thres:
+            return True
 
     return False
 

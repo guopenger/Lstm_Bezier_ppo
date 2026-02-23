@@ -221,7 +221,7 @@ def make_test_env_params(display_size=256):
         'display_size': display_size,
         'max_past_step': 1,
         #'number_of_vehicles': cfg.NUMBER_OF_VEHICLES,
-        'number_of_vehicles': 60,      # ← 改这里：50辆车
+        'number_of_vehicles': 70,      # ← 改这里：50辆车
         'number_of_walkers': cfg.NUMBER_OF_WALKERS,
         'dt': cfg.CARLA_DT,
         'task_mode': 'random',
@@ -245,7 +245,7 @@ def make_test_env_params(display_size=256):
         'ego_vehicle_filter': 'vehicle.lincoln*',
         'port': cfg.CARLA_PORT,
         #'town': cfg.CARLA_TOWN,
-        'town': 'Town04',          # ← 改这里：town1
+        'town': 'Town01',          # ← 改这里：Town01-05-Town10HD_Opt
         # Hierarchical RL
         'hierarchical': True,
         'state_dim': cfg.STATE_DIM,
@@ -302,8 +302,8 @@ def test(ckpt_path, num_episodes=3, display_size=256):
     # 3. 设置 Pygame 窗口 (鸟瞰图 + HUD 信息面板)
     # ------------------------------------------------------------------
     # 环境 __init__ 已经调用 pygame.init() 并创建了 display_size*3 窗口
-    # 重新设置窗口大小: 鸟瞰图(display_size) + HUD面板(600px)
-    hud_width = 600
+    # 重新设置窗口大小: 鸟瞰图(display_size) + HUD面板(450px)
+    hud_width = 450
     screen_w = display_size + hud_width
     screen_h = display_size
     screen = pygame.display.set_mode(
@@ -473,8 +473,8 @@ if __name__ == '__main__':
         '--episodes', type=int, default=3,
         help='测试 episode 数量 (默认: 3)')
     parser.add_argument(
-        '--display-size', type=int, default=600,
-        help='Pygame 鸟瞰图尺寸 (默认: 600)')
+        '--display-size', type=int, default=450,
+        help='Pygame 鸟瞰图尺寸 (默认: 450)')
 
 
     args = parser.parse_args()

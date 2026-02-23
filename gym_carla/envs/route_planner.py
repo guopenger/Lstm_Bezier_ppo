@@ -233,6 +233,36 @@ class RoutePlanner():
 
     return False
 
+  def rebuild_from_vehicle(self):
+    """从车辆当前位置重建轨迹（用于换道后更新全局轨迹）"""
+    try:
+        current_wp = self._map.get_waypoint(self._vehicle.get_location())
+        if current_wp is None or current_wp.lane_type != carla.LaneType.Driving:
+            return False
+
+        # 安全兜底：确认新 waypoint 方向与车辆行驶方向一致
+        veh_yaw = self._vehicle.get_transform().rotation.yaw
+        wp_yaw = current_wp.transform.rotation.yaw
+        yaw_diff = abs(veh_yaw - wp_yaw)
+        yaw_diff = min(yaw_diff, 360 - yaw_diff)  # 取最小夹角
+        
+        if yaw_diff > 90:  # 夹角超过 90° = 方向相反
+            print(f"[RoutePlanner] rebuild 拒绝: 方向差 {yaw_diff:.0f}° (疑似对向车道！)")
+            return False
+        
+        self._waypoints_queue.clear()
+        self._waypoint_buffer.clear()
+        
+        self._current_waypoint = current_wp
+        self._waypoints_queue.append((current_wp.next(self._sampling_radius)[0], RoadOption.LANEFOLLOW))
+        self._compute_next_waypoints(k=200)
+        
+        return True
+    except Exception as e:
+        print(f"[RoutePlanner] rebuild_from_vehicle failed: {e}")
+        return False
+
+
 def retrieve_options(list_waypoints, current_waypoint):
   """
   Compute the type of connection between the current active waypoint and the multiple waypoints present in

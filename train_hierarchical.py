@@ -228,12 +228,18 @@ class HierarchicalPPOTrainer:
         # 1. 计算 GAE advantages 和 returns
         self.rollout.compute_returns_and_advantages(last_value, gamma, gae_lambda)
 
+        # 防护1: 检查 returns/advantages 是否含 NaN
         ret = np.array(self.rollout.returns, dtype=np.float32)
+        adv = np.array(self.rollout.advantages, dtype=np.float32)
+        if np.isnan(ret).any() or np.isnan(adv).any():
+            print("[WARN] NaN detected in returns/advantages, skipping this update")
+            self.rollout.clear()
+            return {'policy_loss': 0, 'value_loss': 0, 'entropy': 0, 'clip_fraction': 0}
+
         ret_mean = ret.mean()
         ret_std = ret.std() + 1e-8
         self.rollout.returns = (ret - ret_mean) / ret_std
 
-        # 2. 多轮 PPO epoch 更新
         total_policy_loss = 0.0
         total_value_loss = 0.0
         total_entropy = 0.0
@@ -244,7 +250,6 @@ class HierarchicalPPOTrainer:
             for batch in self.rollout.get_mini_batches(
                     self.num_mini_batches, self.device):
 
-                # 评估当前策略下的 log_prob 和 value
                 eval_result = self.policy.evaluate_actions(
                     batch['states'], batch['goals'], batch['offsets'])
 
@@ -254,40 +259,47 @@ class HierarchicalPPOTrainer:
                 entropy_offset = eval_result['entropy_offset']
                 new_value = eval_result['value']
 
-                # --- Policy Loss (联合 ratio) ---
                 old_log_prob = batch['old_log_probs_goal'] + batch['old_log_probs_offset']
                 new_log_prob = new_lp_goal + new_lp_offset
 
                 log_ratio = new_log_prob - old_log_prob
+
+                # 防护2: clamp log_ratio 防止 exp() 溢出
+                log_ratio = torch.clamp(log_ratio, -20.0, 20.0)
                 ratio = log_ratio.exp()
 
                 advantages = batch['advantages']
 
-                # Clipped surrogate objective
                 surr1 = ratio * advantages
                 surr2 = torch.clamp(ratio,
                                     1.0 - self.clip_epsilon,
                                     1.0 + self.clip_epsilon) * advantages
                 policy_loss = -torch.min(surr1, surr2).mean()
 
-                # Clip fraction (诊断指标)
                 with torch.no_grad():
                     clip_frac = ((ratio - 1.0).abs() > self.clip_epsilon).float().mean()
 
-                # --- Value Loss ---
                 value_loss = F.mse_loss(new_value, batch['returns'])
-
-                # --- Entropy Bonus ---
                 entropy = entropy_goal.mean() + entropy_offset.mean()
 
-                # --- Total Loss ---
                 loss = (policy_loss
                         + self.value_coef * value_loss
                         - self.entropy_coef * entropy)
 
+                # 防护3: loss 为 NaN/Inf 时跳过本次更新
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"[WARN] NaN/Inf loss detected (epoch={epoch}), skipping mini-batch")
+                    self.optimizer.zero_grad()
+                    continue
+
                 self.optimizer.zero_grad()
                 loss.backward()
-                # 分别裁剪 Actor 和 Critic 的梯度（避免互相干扰）
+
+                # 防护4: 将 NaN 梯度替换为 0（最后一道防线）
+                for p in self.policy.parameters():
+                    if p.grad is not None and torch.isnan(p.grad).any():
+                        p.grad.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+
                 nn.utils.clip_grad_norm_(self.policy.q1.parameters(), self.max_grad_norm)
                 nn.utils.clip_grad_norm_(self.policy.q2.parameters(), self.max_grad_norm)
                 nn.utils.clip_grad_norm_(self.policy.critic.parameters(), self.max_grad_norm)
@@ -299,7 +311,6 @@ class HierarchicalPPOTrainer:
                 total_clip_frac += clip_frac.item()
                 n_updates += 1
 
-        # 3. 清空 rollout buffer
         self.rollout.clear()
 
         return {

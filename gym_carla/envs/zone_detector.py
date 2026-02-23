@@ -28,6 +28,17 @@ zone_detector.py — 8 区域栅格感知模块
     [2:10]  Δv_1 ~ Δv_8   8 区域相对速度 (m/s)
     [10:18] Δd_1 ~ Δd_8   8 区域相对距离 (m)
 
+Zone → State Index 映射确认：
+
+Zone 1 (RR 右后): Δv = state[2],  Δd = state[10]
+Zone 2 (CR 中后): Δv = state[3],  Δd = state[11]
+Zone 3 (LR 左后): Δv = state[4],  Δd = state[12]
+Zone 4 (LS 左侧): Δv = state[5],  Δd = state[13]
+Zone 5 (LF 左前): Δv = state[6],  Δd = state[14]
+Zone 6 (CF 中前): Δv = state[7],  Δd = state[15]
+Zone 7 (RF 右前): Δv = state[8],  Δd = state[16]
+Zone 8 (RS 右侧): Δv = state[9],  Δd = state[17]
+
 与 misc.py 的坐标系一致性:
   本模块使用与 misc.get_local_pose() 相同的局部坐标变换:
     local_x =  dx * cos(ego_yaw) + dy * sin(ego_yaw)   → 前方为正

@@ -15,7 +15,7 @@ import numpy as np
 from gym_carla import config as cfg
 
 
-def get_hierarchical_reward(ego, collision_hist, desired_speed, goal, last_lane_speed):
+def get_hierarchical_reward(ego, collision_hist, desired_speed, goal, last_lane_speed, cf_dist=50.0, cf_rel_speed=0.0):
     """
     计算论文中的分层奖励函数
     
@@ -25,14 +25,15 @@ def get_hierarchical_reward(ego, collision_hist, desired_speed, goal, last_lane_
         desired_speed: V_max in paper (m/s)
         goal: Q1 action (0=left lane change, 1=keep lane, 2=right lane change)
         last_lane_speed: 上一次保持车道时的速度 (m/s)
-    
+        cf_dist: 前方车辆距离 (m)，默认 50.0 表示无车
+        cf_rel_speed: 前方车辆相对速度 (m/s)，正值表示前车更快
+
     Returns:
         tuple: (reward, new_last_lane_speed)
     """
     # --- 0. 基础数据 ---
     v = ego.get_velocity()
     current_speed = np.sqrt(v.x**2 + v.y**2)  # m/s
-    v_max = desired_speed  # 论文中的 V_max
     
     # --- 1. 碰撞因子 P_c (Eq.5) ---
     p_c = 1.0 if len(collision_hist) > 0 else 0.0
@@ -44,8 +45,7 @@ def get_hierarchical_reward(ego, collision_hist, desired_speed, goal, last_lane_
     
     if is_lane_change:
         # 换道后速度是否提升（论文原文："the vehicle's speed has increased after changing lanes"）
-        # 加一个小阈值 0.5 m/s 避免噪声
-        if current_speed > last_lane_speed + 1.5:
+        if current_speed > last_lane_speed + 1: # 增加大概3.5m/s
             p_l = 1.0
     else:
         # 保持车道时，更新基准速度
@@ -57,6 +57,22 @@ def get_hierarchical_reward(ego, collision_hist, desired_speed, goal, last_lane_
     sigma_c = -50.0 * p_c
     
     # σ_v: 速度跟踪奖励 (Eq.6)
+    if cf_dist < 15.0:
+        # 前方有车：目标速度 = 前车速度 - 安全裕度
+        front_vehicle_speed = current_speed + cf_rel_speed
+        v_max = front_vehicle_speed
+
+        # 距离太近时：额外减速
+        if cf_dist < 8.0:
+            penalty = (8.0 - cf_dist) / 8.0 * 2.0  # 距离 8m→0, 0m→2.0 m/s
+            v_max = max(0.0, v_max - penalty)
+        
+        # 如果前车很慢（<3 m/s），允许稍微快一点（鼓励换道）
+        if front_vehicle_speed < 3.0:
+            v_max = min(v_max + 1.0, desired_speed * 0.5)
+    else:
+        v_max = desired_speed  # 论文中的 V_max=8，大概28m/s
+    
     err_v = current_speed - v_max
     # 避免除零，虽然 v_max 通常 > 0
     sigma_v = 10.0 * np.exp(-(err_v**2) / (5.0 * max(v_max, 1.0)))
