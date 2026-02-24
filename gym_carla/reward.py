@@ -57,19 +57,16 @@ def get_hierarchical_reward(ego, collision_hist, desired_speed, goal, last_lane_
     sigma_c = -50.0 * p_c
     
     # σ_v: 速度跟踪奖励 (Eq.6)
-    if cf_dist < 15.0:
+    if cf_dist < 20.0:
         # 前方有车：目标速度 = 前车速度 - 安全裕度
         front_vehicle_speed = current_speed + cf_rel_speed
         v_max = front_vehicle_speed
 
         # 距离太近时：额外减速
-        if cf_dist < 8.0:
-            penalty = (8.0 - cf_dist) / 8.0 * 2.0  # 距离 8m→0, 0m→2.0 m/s
+        if cf_dist < 15.0:
+            penalty = (15.0 - cf_dist) / 15.0 * 4.0  # 距离 8m→0, 0m→2.0 m/s
             v_max = max(0.0, v_max - penalty)
         
-        # 如果前车很慢（<3 m/s），允许稍微快一点（鼓励换道）
-        if front_vehicle_speed < 3.0:
-            v_max = min(v_max + 1.0, desired_speed * 0.5)
     else:
         v_max = desired_speed  # 论文中的 V_max=8，大概28m/s
     

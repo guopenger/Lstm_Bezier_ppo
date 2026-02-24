@@ -67,6 +67,8 @@ class BezierFitting:
         goal: int,
         offset: int,
         use_smooth: bool = False,
+        cf_dist: float = 50.0,
+        ego_speed: float = 8.0,
     ) -> np.ndarray:
         """根据 RL 的 (Goal, Offset) 输出生成参考轨迹。
 
@@ -90,7 +92,21 @@ class BezierFitting:
         s0, d0 = self.frenet.cartesian_to_frenet(ego_x, ego_y, ego_yaw)
 
         # Step 2: 确定终点 Frenet 坐标
-        sf = s0 + self.plan_horizon
+        # Step 2: 根据 goal 决策动态调整规划距离
+        if goal == 1:
+            if cf_dist < self.plan_horizon:
+                # 前方有障碍物，缩短规划距离到障碍物后方
+                safe_margin = 2.0  # 跟车距离 2 米
+                adjusted_horizon = max(cf_dist - safe_margin, 5.0)
+                sf = s0 + adjusted_horizon
+                
+                print(f"[Bezier] 保持车道 + 前方障碍物 {cf_dist:.1f}m → 跟车模式，规划 {adjusted_horizon:.1f}m")
+            else:
+                # 前方无障碍物，正常规划
+                sf = s0 + self.plan_horizon
+        else:
+            # 前方换道，正常规划
+            sf = s0 + self.plan_horizon
 
         # 限制 sf 不超过参考线总长度
         sf = min(sf, self.frenet.total_length - 0.1)

@@ -114,6 +114,8 @@ class TrajectoryTracker:
         self,
         trajectory: np.ndarray,
         ego_state: EgoState,
+        cf_dist: float = 50.0,        # 新增参数：前方障碍物距离
+        cf_rel_speed: float = 0.0,    # 新增参数：前方车辆相对速度
     ) -> Tuple[float, float, float]:
         """计算跟踪参考轨迹所需的控制指令。
 
@@ -134,7 +136,7 @@ class TrajectoryTracker:
         steer = self._pure_pursuit(trajectory, ego_state)
 
         # --- 纵向控制: PID + 曲率限速 ---
-        target_speed = self._adaptive_target_speed(trajectory, ego_state)
+        target_speed = self._adaptive_target_speed(trajectory, ego_state, cf_dist, cf_rel_speed)
         throttle, brake = self._pid_speed_control(ego_state.speed, target_speed)
 
         return throttle, steer, brake
@@ -256,7 +258,9 @@ class TrajectoryTracker:
         return throttle, brake
 
     def _adaptive_target_speed(
-        self, trajectory: np.ndarray, ego: EgoState
+        self, trajectory: np.ndarray, ego: EgoState,
+        cf_dist: float = 50.0,
+        cf_rel_speed: float = 0.0,
     ) -> float:
         """根据轨迹曲率自适应调整目标速度 (弯道减速)。
 
@@ -269,6 +273,27 @@ class TrajectoryTracker:
         Returns:
             target_speed (m/s)。
         """
+        # 跟车模式逻辑
+        if cf_dist < 15.0:
+            # 前方有车，计算前车速度
+            front_vehicle_speed = ego.speed + cf_rel_speed
+            
+            if front_vehicle_speed < 1.0:
+                # 前车停止，ego 也要停止
+                return 0.0
+            elif cf_dist < 10.0:
+                # 距离很近（<10m），严格跟随前车速度
+                target_speed = front_vehicle_speed
+                # 距离太近时额外减速
+                if cf_dist < 5.0:
+                    penalty = (5.0 - cf_dist) / 5.0 * 2.0  # 5m→0m, 减速 0→2 m/s
+                    target_speed = max(0.0, target_speed - penalty)
+                return target_speed
+            else:
+                # 距离适中（10-15m），允许稍快但不超过期望速度
+                target_speed = min(front_vehicle_speed + 1.0, self.desired_speed)
+                return target_speed
+
         if len(trajectory) < 3:
             return self.desired_speed
 
@@ -361,7 +386,6 @@ class TrajectoryTracker:
         while angle < -math.pi:
             angle += 2.0 * math.pi
         return angle
-
 
 # ======================================================================
 # 快速自测

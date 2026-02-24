@@ -53,12 +53,12 @@ GAMMA = 0.99                 # 折扣因子
 GAE_LAMBDA = 0.95            # GAE λ (Generalized Advantage Estimation)
 PPO_CLIP_EPSILON = 0.2       # PPO clip ratio ε
 VALUE_COEF = 0.5             # Value loss 系数 c1
-ENTROPY_COEF = 0.005         # Entropy bonus 系数 c2
+ENTROPY_COEF = 0.01          # Entropy bonus 系数 c2
 MAX_GRAD_NORM = 0.5          # 梯度裁剪范数
 # BATCH_SIZE=====================================================
 ROLLOUT_STEPS = 4096         # 每次收集的交互步数
 NUM_MINI_BATCHES = 8         # 每轮分成的 mini-batch 数量
-PPO_EPOCHS = 10              # 每次 rollout 后的 PPO 更新轮数 (6→10, 提高 clip fraction)
+PPO_EPOCHS = 4               # 每次 rollout 后的 PPO 更新轮数 (6→10, 提高 clip fraction)
 NUM_ITERATIONS = 300         # PPO 迭代次数 (总步数 ≈ ROLLOUT_STEPS × NUM_ITERATIONS)
 # ================================================================
 

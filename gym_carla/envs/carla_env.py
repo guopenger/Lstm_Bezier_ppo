@@ -640,6 +640,8 @@ class CarlaEnv(gym.Env):
     # 提前获取前方障碍物信息
     self._cached_zone_state = self.zone_detector.detect(self.world, self.ego, self.carla_map) 
     cf_dist = self._cached_zone_state[15]  # Zone 6 (CF 中前) 距离 
+    cf_rel_speed = self._cached_zone_state[7] # Zone 6 (CF 中前) 相对速度
+
 
     # Update reference line periodically
     if self.time_step % 10 == 0:
@@ -649,7 +651,7 @@ class CarlaEnv(gym.Env):
     try:
       use_smooth = (self.time_step < 10)
       trajectory = self.bezier.generate_trajectory(
-        ego_x, ego_y, ego_yaw, goal, offset, use_smooth=use_smooth)
+        ego_x, ego_y, ego_yaw, goal, offset, use_smooth=use_smooth, cf_dist=cf_dist, ego_speed=ego_speed)
       self._last_trajectory = trajectory
     except Exception as e:
       # Fallback: straight ahead trajectory
@@ -664,7 +666,7 @@ class CarlaEnv(gym.Env):
 
     # Trajectory tracking → vehicle control
     ego_state = EgoState(x=ego_x, y=ego_y, yaw=ego_yaw, speed=ego_speed)
-    throttle, steer, brake = self.tracker.compute_control(trajectory, ego_state)
+    throttle, steer, brake = self.tracker.compute_control(trajectory, ego_state, cf_dist=cf_dist, cf_rel_speed=cf_rel_speed)
 
     # Compute tracking error for reward
     self._last_tracking_error = self.tracker.compute_tracking_error(
@@ -834,7 +836,7 @@ class CarlaEnv(gym.Env):
     if self._lane_change_detected:
         reward -= 0.2 * abs(lane_dis)  # 降低到原来的 1/3
     else:
-        reward -= 0.6 * abs(lane_dis)  # 正常惩罚
+        reward -= 1 * abs(lane_dis)  # 正常惩罚
 
     # 4.五面感知障碍物惩罚(连续信号, 碰撞前就开始惩罚)
       # 前方有车
@@ -847,7 +849,7 @@ class CarlaEnv(gym.Env):
 
     # 5. 换道成本
     if goal != 1:
-        if cf_dist > 15.0:
+        if cf_dist > 20.0:
             reward -= 1.0   # 没必要换道
         else:
             reward -= 0.1   # 鼓励避障换道

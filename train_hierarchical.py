@@ -236,9 +236,10 @@ class HierarchicalPPOTrainer:
             self.rollout.clear()
             return {'policy_loss': 0, 'value_loss': 0, 'entropy': 0, 'clip_fraction': 0}
 
-        ret_mean = ret.mean()
-        ret_std = ret.std() + 1e-8
-        self.rollout.returns = (ret - ret_mean) / ret_std
+        #bug！删除 Returns 归一化！
+        #ret_mean = ret.mean()
+        #ret_std = ret.std() + 1e-8
+        #self.rollout.returns = (ret - ret_mean) / ret_std
 
         total_policy_loss = 0.0
         total_value_loss = 0.0
@@ -265,7 +266,7 @@ class HierarchicalPPOTrainer:
                 log_ratio = new_log_prob - old_log_prob
 
                 # 防护2: clamp log_ratio 防止 exp() 溢出
-                log_ratio = torch.clamp(log_ratio, -20.0, 20.0)
+                log_ratio = torch.clamp(log_ratio, -5.0, 5.0)
                 ratio = log_ratio.exp()
 
                 advantages = batch['advantages']
