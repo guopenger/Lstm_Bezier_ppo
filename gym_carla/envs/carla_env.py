@@ -381,6 +381,15 @@ class CarlaEnv(gym.Env):
     self.routeplanner = RoutePlanner(self.ego, self.max_waypt)
     self.waypoints, _, self.vehicle_front = self.routeplanner.run_step()
 
+    ego_trans = self.ego.get_transform()
+    # 使用下一个 waypoint 的 yaw 避免方向突变
+    next_yaw = self.waypoints[0][2] if len(self.waypoints) > 0 else ego_trans.rotation.yaw
+    self.waypoints.insert(0, [
+        ego_trans.location.x,
+        ego_trans.location.y,
+        next_yaw
+    ])
+
     # Set ego information for render (only if display is enabled)
     if self.birdeye_render is not None:
       self.birdeye_render.set_hero(self.ego, self.ego.id)
@@ -631,11 +640,6 @@ class CarlaEnv(gym.Env):
     ego_yaw = ego_trans.rotation.yaw / 180.0 * np.pi
     v = self.ego.get_velocity()
     ego_speed = np.sqrt(v.x**2 + v.y**2)
-
-    # 前 10 步强制保持车道，让 Bezier 从 ego 位置平滑回到参考线
-    if self.time_step < 10:
-        goal = 1
-        offset = 0.0
         
     # 提前获取前方障碍物信息
     self._cached_zone_state = self.zone_detector.detect(self.world, self.ego, self.carla_map) 
@@ -649,9 +653,8 @@ class CarlaEnv(gym.Env):
 
     # Generate Bezier trajectory
     try:
-      use_smooth = (self.time_step < 10)
       trajectory = self.bezier.generate_trajectory(
-        ego_x, ego_y, ego_yaw, goal, offset, use_smooth=use_smooth, cf_dist=cf_dist, ego_speed=ego_speed)
+        ego_x, ego_y, ego_yaw, goal, offset, cf_dist=cf_dist, ego_speed=ego_speed)
       self._last_trajectory = trajectory
     except Exception as e:
       # Fallback: straight ahead trajectory
@@ -702,6 +705,17 @@ class CarlaEnv(gym.Env):
     # Route planner update
     self.waypoints, _, self.vehicle_front = self.routeplanner.run_step()
 
+    # 开局前10步：插入车辆位置，让蓝色轨迹从脚下开始
+    if self.time_step < 15:
+        ego_trans = self.ego.get_transform()
+        # 使用下一个 waypoint 的 yaw 避免方向突变
+        next_yaw = self.waypoints[0][2] if len(self.waypoints) > 0 else ego_trans.rotation.yaw
+        self.waypoints.insert(0, [
+            ego_trans.location.x,
+            ego_trans.location.y,
+            next_yaw
+        ])
+    
     # === 被动全局轨迹跟随：蓝色轨迹顺应车辆换道行为 ===
     ego_wp = self.carla_map.get_waypoint(self.ego.get_transform().location)
     cur_lane_id = ego_wp.lane_id
@@ -833,6 +847,11 @@ class CarlaEnv(gym.Env):
     # 3.贝塞尔曲线偏离中心距离惩罚
     ego_x, ego_y = get_pos(self.ego)
     lane_dis, _ = get_lane_dis(self.waypoints, ego_x, ego_y)
+    
+    # 检查 NaN（当车辆正好在 waypoint 上时可能出现）
+    if np.isnan(lane_dis):
+        lane_dis = 0.0
+    
     if self._lane_change_detected:
         reward -= 0.2 * abs(lane_dis)  # 降低到原来的 1/3
     else:

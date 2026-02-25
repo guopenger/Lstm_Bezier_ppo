@@ -66,7 +66,6 @@ class BezierFitting:
         ego_yaw: float,
         goal: int,
         offset: int,
-        use_smooth: bool = False,
         cf_dist: float = 50.0,
         ego_speed: float = 8.0,
     ) -> np.ndarray:
@@ -114,7 +113,7 @@ class BezierFitting:
             # 参考线太短，退化为直行
             sf = s0 + 5.0
 
-        df = self._compute_target_d(d0, goal, offset, use_smooth)
+        df = self._compute_target_d(d0, goal, offset)
 
         # Step 3: 生成 Frenet 系下的贝塞尔轨迹
         s_arr, d_arr = self._bezier_frenet(s0, d0, sf, df)
@@ -128,7 +127,7 @@ class BezierFitting:
     # 轨迹终点 d 的计算
     # ------------------------------------------------------------------
 
-    def _compute_target_d(self, d0: float, goal: int, offset: float, use_smooth: bool = False) -> float:
+    def _compute_target_d(self, d0: float, goal: int, offset: float) -> float:
         """根据 Q1(Goal) 和 Q2(p_off) 计算 Frenet 系终点横向偏移 df。
 
         CARLA 坐标系约定:
@@ -158,14 +157,7 @@ class BezierFitting:
         elif goal == 2:  # 右换道
             d_goal = d0 + self.lane_width
         else:  # goal == 1, 保持车道
-            if use_smooth:
-                # 【平滑模式】开局使用：让曲线贴在车上
-                d_goal = d0 * 0.7
-                if abs(d0) < 0.3:
-                    d_goal = 0.0
-            else:
-                # 【正常模式】训练/测试使用：直接回中心
-                d_goal = 0.0
+            d_goal = 0.0
 
         # 轨迹层: 连续偏移 p_off (论文 Eq.2)
         # offset > 0 向右, offset < 0 向左，必须全链路统一！

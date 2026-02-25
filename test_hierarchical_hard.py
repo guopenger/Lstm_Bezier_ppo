@@ -220,17 +220,15 @@ def make_test_env_params(display_size=256):
         # 关键区别: display_size > 0 以启用 pygame 渲染
         'display_size': display_size,
         'max_past_step': 1,
-        #'number_of_vehicles': cfg.NUMBER_OF_VEHICLES,
-        'number_of_vehicles': 70,      # ← 改这里：50辆车
+        'number_of_vehicles': 10,
         'number_of_walkers': cfg.NUMBER_OF_WALKERS,
         'dt': cfg.CARLA_DT,
         'task_mode': 'random',
-        #'max_time_episode': cfg.MAX_STEPS_PER_EPISODE,
-        'max_time_episode': 2000,      # ← 改这里：1000步
+        'max_time_episode': 50,
         'max_waypt': 12,
-        'obs_range': 32,
+        'obs_range': 48,  # 增大到 48 看到更远
         'lidar_bin': 0.125,
-        'd_behind': 12,
+        'd_behind': 8,  # 减小让更多视野给前方
         'out_lane_thres': 2.0,
         'desired_speed': cfg.DESIRED_SPEED,
         'max_ego_spawn_times': 200,
@@ -244,7 +242,6 @@ def make_test_env_params(display_size=256):
         'continuous_steer_range': [-0.3, 0.3],
         'ego_vehicle_filter': 'vehicle.lincoln*',
         'port': cfg.CARLA_PORT,
-        #'town': cfg.CARLA_TOWN,
         'town': 'Town01',          # ← 改这里：Town01-05-Town10HD_Opt
         # Hierarchical RL
         'hierarchical': True,
@@ -299,12 +296,13 @@ def test(ckpt_path, num_episodes=3, display_size=256):
     env_unwrapped = env.unwrapped  # 获取底层 CarlaEnv
 
     # ------------------------------------------------------------------
-    # 3. 设置 Pygame 窗口 (鸟瞰图 + HUD 信息面板)
+    # 3. 设置 Pygame 窗口 (真实俯视 + 抽象鸟瞰 + HUD)
     # ------------------------------------------------------------------
-    # 环境 __init__ 已经调用 pygame.init() 并创建了 display_size*3 窗口
-    # 重新设置窗口大小: 鸟瞰图(display_size) + HUD面板(450px)
-    hud_width = 450
-    screen_w = display_size + hud_width
+    # 窗口布局: 真实俯视(256) + 抽象鸟瞰(256) + HUD(350)
+    hud_width = 350
+    cam_width = display_size
+    birdeye_width = display_size
+    screen_w = cam_width + birdeye_width + hud_width
     screen_h = display_size
     screen = pygame.display.set_mode(
         (screen_w, screen_h), pygame.HWSURFACE | pygame.DOUBLEBUF)
@@ -322,7 +320,7 @@ def test(ckpt_path, num_episodes=3, display_size=256):
     # ------------------------------------------------------------------
     goal_names = ['← 左换道', '→ 保持车道', '→ 右换道']
     offset_range = cfg.OFFSET_RANGE
-    max_steps = 2000  # 每个 episode 的最大步数 (与环境 max_time_episode 一致)
+    max_steps = 3000
 
     all_rewards = []
     all_steps = []
@@ -393,9 +391,41 @@ def test(ckpt_path, num_episodes=3, display_size=256):
             lat_err = trk_err.get('lateral_error', 0.0)
             head_err = trk_err.get('heading_error', 0.0)
 
-            # 渲染鸟瞰图
+            # 渲染所有视图
             screen.fill((20, 20, 30))
-            render_birdeye(env_unwrapped, screen, display_size)
+            
+            # 1. 真实第三人称俯视图（左侧）
+            if hasattr(env_unwrapped, 'overhead_img') and env_unwrapped.overhead_img is not None:
+                from skimage.transform import resize as sk_resize
+                oh_img = env_unwrapped.overhead_img
+                oh_resized = (sk_resize(oh_img, (display_size, display_size), anti_aliasing=True) * 255).astype(np.uint8)
+                oh_surface = pygame.Surface((display_size, display_size))
+                pygame.surfarray.blit_array(oh_surface, np.transpose(oh_resized, (1, 0, 2)))
+                screen.blit(oh_surface, (0, 0))
+            else:
+                font = pygame.font.SysFont('microsoftyahei', 16)
+                text = font.render('第三人称视图未启用', True, (150, 150, 150))
+                text_rect = text.get_rect(center=(display_size//2, display_size//2))
+                screen.blit(text, text_rect)
+
+            # 2. 抽象鸟瞰图（中间）
+            # 创建临时 surface 用于鸟瞰图渲染
+            birdeye_surface = pygame.Surface((display_size, display_size))
+            env_unwrapped.display = birdeye_surface
+            render_birdeye(env_unwrapped, birdeye_surface, display_size)
+            screen.blit(birdeye_surface, (display_size, 0))
+            env_unwrapped.display = screen  # 恢复原始 display
+
+            # 获取额外分析信息
+            from gym_carla.envs.misc import get_lane_dis, get_pos
+            ego_wp_info = env_unwrapped.carla_map.get_waypoint(
+                env_unwrapped.ego.get_transform().location)
+            lane_id_str = f'{ego_wp_info.lane_id}' if ego_wp_info else '?'
+            lane_w_str = f'{ego_wp_info.lane_width:.1f}m' if ego_wp_info else '?'
+            
+            # 到中心线距离
+            ex, ey = get_pos(env_unwrapped.ego)
+            ld, _ = get_lane_dis(env_unwrapped.waypoints, ex, ey)
 
             # 更新 HUD
             hud.update({
@@ -405,17 +435,21 @@ def test(ckpt_path, num_episodes=3, display_size=256):
                 'Goal': goal_names[goal],
                 'Offset': f'{p_off:+.3f} m',
                 '---2': '',
-                'Speed': f'{speed_kmh:.1f} km/h ({speed_ms:.1f} m/s)',
+                'Speed': f'{speed_kmh:.1f} km/h',
                 'Target': f'{cfg.DESIRED_SPEED * 3.6:.1f} km/h',
                 '---3': '',
                 'Reward': f'{reward:.2f}',
                 'Cum Reward': f'{episode_reward:.1f}',
                 '---4': '',
+                'Lane ID': lane_id_str,
+                'Lane Width': lane_w_str,
+                'Lane Offset': f'{ld:+.2f} m',
                 'Lat Error': f'{lat_err:.3f} m',
                 'Head Error': f'{np.degrees(head_err):.1f}°',
+                '---5': '',
                 'Collision': 'YES !!!' if collision else 'No',
             })
-            hud.render(screen, display_size)
+            hud.render(screen, display_size * 2)
 
             pygame.display.flip()
             clock.tick(20)  # ~20 FPS
