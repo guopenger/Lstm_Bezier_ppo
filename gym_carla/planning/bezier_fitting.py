@@ -16,6 +16,7 @@ bezier_fitting.py — 在 Frenet 坐标系下进行 5 阶贝塞尔曲线轨迹�
 """
 
 import numpy as np
+import math
 from typing import List, Tuple, Optional
 
 from gym_carla.planning.frenet_transform import FrenetTransform
@@ -68,6 +69,8 @@ class BezierFitting:
         offset: int,
         cf_dist: float = 50.0,
         ego_speed: float = 8.0,
+        world=None,
+        ego_vehicle=None,
     ) -> np.ndarray:
         """根据 RL 的 (Goal, Offset) 输出生成参考轨迹。
 
@@ -90,25 +93,10 @@ class BezierFitting:
         # Step 1: 自车 → Frenet
         s0, d0 = self.frenet.cartesian_to_frenet(ego_x, ego_y, ego_yaw)
 
-        # Step 2: 确定终点 Frenet 坐标
-        # Step 2: 根据 goal 决策动态调整规划距离
-        if goal == 1:
-            if cf_dist < self.plan_horizon:
-                # 前方有障碍物，缩短规划距离到障碍物后方
-                safe_margin = 2.0  # 跟车距离 2 米
-                adjusted_horizon = max(cf_dist - safe_margin, 5.0)
-                sf = s0 + adjusted_horizon
-                
-                print(f"[Bezier] 保持车道 + 前方障碍物 {cf_dist:.1f}m → 跟车模式，规划 {adjusted_horizon:.1f}m")
-            else:
-                # 前方无障碍物，正常规划
-                sf = s0 + self.plan_horizon
-        else:
-            # 前方换道，正常规划
-            sf = s0 + self.plan_horizon
-
-        # 限制 sf 不超过参考线总长度
+        # Step 2: 确定终点 Frenet 坐标（始终使用完整规划距离）
+        sf = s0 + self.plan_horizon
         sf = min(sf, self.frenet.total_length - 0.1)
+        
         if sf <= s0:
             # 参考线太短，退化为直行
             sf = s0 + 5.0
@@ -121,12 +109,182 @@ class BezierFitting:
         # Step 4: Frenet → Cartesian
         trajectory = self.frenet.frenet_to_cartesian_array(s_arr, d_arr)
 
+        # Step 5: 智能碰撞检测截断
+        if world is not None and ego_vehicle is not None:
+            trajectory = self._smart_collision_truncation(
+                trajectory=trajectory,
+                world=world,
+                ego_vehicle=ego_vehicle,
+                ego_yaw=ego_yaw,
+                ego_speed=ego_speed,
+                min_points=2,  # 至少保留20个点，保证轨迹可用
+            )
+            
         return trajectory
+
+
+    # ------------------------------------------------------------------
+    # 检测障碍物截断贝塞尔曲线
+    # ------------------------------------------------------------------
+    def _smart_collision_truncation(
+        self,
+        trajectory: np.ndarray,
+        world,
+        ego_vehicle,
+        ego_yaw: float,
+        ego_speed: float,
+        min_points: int = 2,
+    ) -> np.ndarray:
+        """
+        智能碰撞检测截断：只在确定会碰撞时才截断轨迹
+        
+        设计原则：
+        1. 使用自车坐标系统一计算（避免转弯时坐标系混乱）
+        2. 使用 OBB 碰撞预测（考虑车辆尺寸）
+        3. 动态预测（考虑障碍物速度）
+        4. 保守策略（只截断真正会碰撞的情况）
+        
+        Args:
+            trajectory: (N, 2) 轨迹点
+            world: CARLA world
+            ego_vehicle: CARLA ego vehicle
+            ego_yaw: 自车航向角 (rad)
+            ego_speed: 自车速度 (m/s)
+            min_points: 最少保留的轨迹点数
+            
+        Returns:
+            截断后的轨迹 (M, 2)，M >= min_points
+        """
+        if len(trajectory) < min_points:
+            return trajectory
+            
+        # 获取自车信息
+        ego_transform = ego_vehicle.get_transform()
+        ego_x = ego_transform.location.x
+        ego_y = ego_transform.location.y
+        ego_bb = ego_vehicle.bounding_box
+        ego_half_length = ego_bb.extent.x
+        ego_half_width = ego_bb.extent.y
+        
+        # 自车坐标系旋转矩阵
+        cos_yaw = math.cos(ego_yaw)
+        sin_yaw = math.sin(ego_yaw)
+        
+        # 获取所有车辆
+        vehicle_list = world.get_actors().filter('vehicle.*')
+        
+        # 计算每个轨迹点到达的预计时间
+        # 假设沿轨迹匀速行驶
+        cumulative_dist = np.zeros(len(trajectory))
+        for i in range(1, len(trajectory)):
+            dx = trajectory[i, 0] - trajectory[i-1, 0]
+            dy = trajectory[i, 1] - trajectory[i-1, 1]
+            cumulative_dist[i] = cumulative_dist[i-1] + math.sqrt(dx*dx + dy*dy)
+        
+        # 预计到达时间 (秒)
+        arrival_time = cumulative_dist / max(ego_speed, 1.0)
+        
+        cutoff_index = len(trajectory)  # 默认不截断
+        
+        for vehicle in vehicle_list:
+            if vehicle.id == ego_vehicle.id:
+                continue
+                
+            v_transform = vehicle.get_transform()
+            v_loc = v_transform.location
+            v_bb = vehicle.bounding_box
+            v_velocity = vehicle.get_velocity()
+            v_yaw = math.radians(v_transform.rotation.yaw)
+            
+            # 障碍物速度分量
+            v_vx = v_velocity.x
+            v_vy = v_velocity.y
+            v_speed = math.sqrt(v_vx**2 + v_vy**2)
+            
+            # 障碍物尺寸
+            v_half_length = v_bb.extent.x
+            v_half_width = v_bb.extent.y
+            
+            # 碰撞检测半径（两车的对角线之和的一半）
+            collision_radius = math.sqrt(
+                (ego_half_length + v_half_length)**2 + 
+                (ego_half_width + v_half_width)**2
+            ) * 0.3  # 0.7 是安全系数，稍微收紧一点
+            
+            # 逐点检查轨迹是否与障碍物碰撞
+            for i in range(min_points, len(trajectory)):
+                traj_x, traj_y = trajectory[i]
+                t = arrival_time[i]
+                
+                # 预测障碍物在时刻 t 的位置
+                pred_vx = v_loc.x + v_vx * t
+                pred_vy = v_loc.y + v_vy * t
+                
+                # 计算轨迹点与预测障碍物位置的距离
+                dist = math.sqrt((traj_x - pred_vx)**2 + (traj_y - pred_vy)**2)
+                
+                # 在自车坐标系下检查：障碍物是否在前方
+                # 转换到自车坐标系
+                dx = pred_vx - ego_x
+                dy = pred_vy - ego_y
+                local_x = dx * cos_yaw + dy * sin_yaw  # 前方为正
+                local_y = -dx * sin_yaw + dy * cos_yaw  # 左方为正
+                
+                # 只考虑前方的障碍物（local_x > 0）
+                if local_x < 0:
+                    continue
+                
+                # 检查是否会碰撞
+                if dist < collision_radius:
+                    # 额外检查：障碍物是否真的在轨迹路径上
+                    # 计算轨迹点到障碍物的横向距离
+                    traj_dx = pred_vx - traj_x
+                    traj_dy = pred_vy - traj_y
+                    
+                    # 轨迹方向（使用相邻点）
+                    if i < len(trajectory) - 1:
+                        fwd_x = trajectory[i+1, 0] - trajectory[i, 0]
+                        fwd_y = trajectory[i+1, 1] - trajectory[i, 1]
+                    else:
+                        fwd_x = trajectory[i, 0] - trajectory[i-1, 0]
+                        fwd_y = trajectory[i, 1] - trajectory[i-1, 1]
+                    
+                    fwd_len = math.sqrt(fwd_x**2 + fwd_y**2)
+                    if fwd_len > 0.01:
+                        fwd_x /= fwd_len
+                        fwd_y /= fwd_len
+                        
+                        # 横向距离
+                        lateral_dist = abs(traj_dx * (-fwd_y) + traj_dy * fwd_x)
+                        
+                        # 只有横向距离小于碰撞半径才认为是真正的碰撞
+                        if lateral_dist < collision_radius:
+                            # 检查是否是同向车辆（同向车不截断，交给跟车逻辑）
+                            v_forward_x = math.cos(v_yaw)
+                            v_forward_y = math.sin(v_yaw)
+                            direction_dot = fwd_x * v_forward_x + fwd_y * v_forward_y
+                            
+                            if direction_dot > 0.7:
+                                # 同向车辆，且速度差不大，不截断（交给跟车逻辑）
+                                if v_speed > 0.5:
+                                    continue
+                            
+                            # 找到碰撞点，更新截断位置
+                            if i < cutoff_index:
+                                cutoff_index = i
+                                break  # 找到最近的碰撞点，检查下一个车辆
+        
+        # 截断轨迹（保留安全距离）
+        if cutoff_index < len(trajectory):
+            safe_cutoff = max(min_points, cutoff_index - 3)
+            return trajectory[:safe_cutoff]
+        
+        return trajectory
+
 
     # ------------------------------------------------------------------
     # 轨迹终点 d 的计算
     # ------------------------------------------------------------------
-
     def _compute_target_d(self, d0: float, goal: int, offset: float) -> float:
         """根据 Q1(Goal) 和 Q2(p_off) 计算 Frenet 系终点横向偏移 df。
 

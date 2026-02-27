@@ -654,7 +654,7 @@ class CarlaEnv(gym.Env):
     # Generate Bezier trajectory
     try:
       trajectory = self.bezier.generate_trajectory(
-        ego_x, ego_y, ego_yaw, goal, offset, cf_dist=cf_dist, ego_speed=ego_speed)
+        ego_x, ego_y, ego_yaw, goal, offset, cf_dist=cf_dist, ego_speed=ego_speed, world=self.world, ego_vehicle=self.ego)
       self._last_trajectory = trajectory
     except Exception as e:
       # Fallback: straight ahead trajectory

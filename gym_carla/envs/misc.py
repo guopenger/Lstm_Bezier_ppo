@@ -141,6 +141,12 @@ def get_lane_dis(waypoints, x, y):
   lv = np.linalg.norm(np.array(vec))
   w = np.array([np.cos(waypt[2]/180*np.pi), np.sin(waypt[2]/180*np.pi)])
   cross = np.cross(w, vec/lv)
+  # 避免除零
+  if lv < 1e-6:
+      cross = 0.0
+  else:
+      cross = np.cross(w, vec/lv)
+
   dis = - lv * cross
   return dis, w
 

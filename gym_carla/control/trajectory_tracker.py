@@ -224,7 +224,6 @@ class TrajectoryTracker:
     # ------------------------------------------------------------------
     # 纵向控制: PID + 曲率自适应限速
     # ------------------------------------------------------------------
-
     def _pid_speed_control(
         self, current_speed: float, target_speed: float
     ) -> Tuple[float, float]:
@@ -239,7 +238,26 @@ class TrajectoryTracker:
         """
         error = target_speed - current_speed
 
-        # PID
+        # 紧急制动：目标速度接近0且当前速度>0.5m/s
+        if target_speed < 0.5 and current_speed > 0.5:
+            # 强制全力刹车
+            self._error_integral = 0.0  # 重置积分器
+            self._prev_error = error
+            return 0.0, self.max_brake  # throttle=0, brake=0.8
+
+        # 缓慢停车：目标速度接近0且当前速度<0.5m/s
+        if target_speed < 0.5 and current_speed > 0.1:
+            # 中等刹车力度
+            self._prev_error = error
+            return 0.0, 0.5
+
+        # 完全停止：目标速度接近0且当前速度很小
+        if target_speed < 0.5 and current_speed <= 0.1:
+            self._error_integral = 0.0
+            self._prev_error = 0.0
+            return 0.0, 0.3  # 保持轻微刹车防止溜车
+
+        # 正常PID控制
         self._error_integral += error * self.dt
         # 积分器抗饱和 (Anti-windup)
         self._error_integral = np.clip(self._error_integral, -10.0, 10.0)
@@ -273,42 +291,57 @@ class TrajectoryTracker:
         Returns:
             target_speed (m/s)。
         """
-        # 跟车模式逻辑
-        if cf_dist < 15.0:
-            # 前方有车，计算前车速度
+        # 根据轨迹点数量动态减速
+        num_points = len(trajectory)
+        if num_points < 10:
+            # 轨迹被严重截断（<10个点，约<4米），紧急制动
+            return 0.0
+        elif num_points < 20:
+            # 轨迹较短（10-20个点，约4-8米），大幅减速
+            # 线性插值：10点→0m/s, 20点→3m/s
+            return (num_points - 10) * 0.3
+        elif num_points < 40:
+            # 轨迹中等（20-40个点，约8-16米），适度减速
+            # 线性插值：20点→3m/s, 40点→6m/s
+            return 3.0 + (num_points - 20) * 0.15
+
+        # 跟车模式：基于 zone_detector 的前方障碍物距离
+        if cf_dist < 20.0:
+            # 计算前车速度
             front_vehicle_speed = ego.speed + cf_rel_speed
             
-            if front_vehicle_speed < 1.0:
-                # 前车停止，ego 也要停止
-                return 0.0
-            elif cf_dist < 10.0:
-                # 距离很近（<10m），严格跟随前车速度
-                target_speed = front_vehicle_speed
-                # 距离太近时额外减速
+            if front_vehicle_speed < 0.5:
+                # 前车停止
                 if cf_dist < 5.0:
-                    penalty = (5.0 - cf_dist) / 5.0 * 2.0  # 5m→0m, 减速 0→2 m/s
-                    target_speed = max(0.0, target_speed - penalty)
-                return target_speed
+                    return 0.0
+                elif cf_dist < 10.0:
+                    return max(0.0, (cf_dist - 5.0) * 0.5)
+                else:
+                    return max(0.0, cf_dist - 8.0)
             else:
-                # 距离适中（10-15m），允许稍快但不超过期望速度
-                target_speed = min(front_vehicle_speed + 1.0, self.desired_speed)
-                return target_speed
-
+                # 前车移动，根据距离调整速度
+                if cf_dist < 5.0:
+                    # 距离太近，减速
+                    return 0.0
+                elif cf_dist < 15.0:
+                    # 距离适中，跟随
+                    return front_vehicle_speed
+                else:
+                    # 距离较远，可以稍快
+                    return min(front_vehicle_speed + 1.5, self.desired_speed)
+    
         if len(trajectory) < 3:
             return self.desired_speed
-
+    
         # 计算轨迹前方一段的平均曲率
         curvature = self._compute_curvature(trajectory)
         if len(curvature) == 0:
             return self.desired_speed
-
-        # 取前方 10 个点的最大曲率
+    
         kappa_max = float(np.max(curvature[:min(10, len(curvature))]))
-
-        # 曲率越大速度越低
         target = self.desired_speed - self.curvature_speed_factor * kappa_max
         target = max(target, self.min_speed)
-
+    
         return target
 
     @staticmethod

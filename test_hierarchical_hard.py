@@ -154,8 +154,11 @@ def render_birdeye(env_unwrapped, display, display_size):
 
     # 渲染鸟瞰图
     render_types = ['roadmap', 'actors']
-    if env_unwrapped.display_route:
-        render_types.append('waypoints')
+    # ！！！隐藏全局carla蓝色路径显示
+    #if env_unwrapped.display_route:
+    #    render_types.append('waypoints')
+
+
     br.render(display, render_types)
 
     # 绘制轨迹 (如果有)
@@ -220,15 +223,15 @@ def make_test_env_params(display_size=256):
         # 关键区别: display_size > 0 以启用 pygame 渲染
         'display_size': display_size,
         'max_past_step': 1,
-        'number_of_vehicles': 10,
+        'number_of_vehicles': 30,
         'number_of_walkers': cfg.NUMBER_OF_WALKERS,
         'dt': cfg.CARLA_DT,
         'task_mode': 'random',
-        'max_time_episode': 50,
+        'max_time_episode': 500,
         'max_waypt': 12,
-        'obs_range': 48,  # 增大到 48 看到更远
+        'obs_range': 48,                     # 增大到 48 看到更远
         'lidar_bin': 0.125,
-        'd_behind': 8,  # 减小让更多视野给前方
+        'd_behind': 8,                       # 减小让更多视野给前方
         'out_lane_thres': 2.0,
         'desired_speed': cfg.DESIRED_SPEED,
         'max_ego_spawn_times': 200,
@@ -242,7 +245,7 @@ def make_test_env_params(display_size=256):
         'continuous_steer_range': [-0.3, 0.3],
         'ego_vehicle_filter': 'vehicle.lincoln*',
         'port': cfg.CARLA_PORT,
-        'town': 'Town01',          # ← 改这里：Town01-05-Town10HD_Opt
+        'town': 'Town04',                    # ← 改这里：Town01-05-Town10HD_Opt
         # Hierarchical RL
         'hierarchical': True,
         'state_dim': cfg.STATE_DIM,
@@ -507,8 +510,8 @@ if __name__ == '__main__':
         '--episodes', type=int, default=3,
         help='测试 episode 数量 (默认: 3)')
     parser.add_argument(
-        '--display-size', type=int, default=450,
-        help='Pygame 鸟瞰图尺寸 (默认: 450)')
+        '--display-size', type=int, default=550,
+        help='Pygame 鸟瞰图尺寸 (默认: 550)')
 
 
     args = parser.parse_args()
