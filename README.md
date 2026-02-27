@@ -6,22 +6,22 @@
 
 ## 🎬 演示效果
 
-### 场景1：town3多车博弈
+**场景1：town3多车博弈**
 ![直道保持](pic/carla_lstm_g1.gif)
 
-### 场景2：town3轨迹追踪
+**场景2：town3轨迹追踪**
 ![避障换道](pic/carla_lstm_g2.gif)
 
-### 场景3：town4高速路段
+**场景3：town4高速路段**
 ![复杂路况](pic/carla_lstm_g3.gif)
 
 
 
 ## 🚕 训练曲线
-
-![reward](pic\reward.png)
-
-![train](pic\train.png)
+**reward曲线如下，可以看到在150步的情况下就收敛了**
+![reward](pic/reward.png)
+**train参数曲线如下，可以看到在训练出来的规划器基本可以稳定在carla环境中运行450步左右(上限500步)**
+![train](pic/train.png)
 
 
 
